@@ -195,12 +195,17 @@ class SessionManager:
             return parts[0] if parts else "..."
 
     def send_stream(
-        self, tab_id: str, text: str, timeout: int = 120
+        self, tab_id: str, text: str, timeout: int = 120,
+        image: str | None = None,
     ) -> Generator[dict, None, None]:
-        """Streaming response. Yields cumulative assistant dicts."""
+        """Streaming response. Yields cumulative assistant dicts.
+
+        *image* is an optional data URL (e.g. from the browser camera);
+        it is sent to the vision model for this turn only.
+        """
         session = self._require_session(tab_id)
         with session.lock:
-            yield from self._stream_locked(session, text)
+            yield from self._stream_locked(session, text, image)
 
     # ── Internals ──
 
@@ -211,14 +216,22 @@ class SessionManager:
         return session
 
     def _stream_locked(
-        self, session: AssistantSession, text: str
+        self, session: AssistantSession, text: str, image: str | None = None
     ) -> Generator[dict, None, None]:
         """Core streaming. Caller holds session.lock."""
         if session.session_id is None:
             session.session_id = str(uuid.uuid4())
             session.created_at = time.time()
 
-        session.messages.append({"role": "user", "content": text})
+        if image:
+            # OpenAI multimodal content; the image rides along for this
+            # turn only (see cleanup below) so history stays cheap.
+            session.messages.append({"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": image}},
+            ]})
+        else:
+            session.messages.append({"role": "user", "content": text})
         # Cap context window (keep the most recent turns).
         if len(session.messages) > HISTORY_LIMIT:
             session.messages = session.messages[-HISTORY_LIMIT:]
@@ -239,11 +252,17 @@ class SessionManager:
                     },
                 }
         except AIError as e:
+            self._strip_image(session, text, image)
             yield {"type": "error", "error": str(e)}
             return
         except Exception as e:  # pragma: no cover - defensive
+            self._strip_image(session, text, image)
             yield {"type": "error", "error": f"{type(e).__name__}: {e}"}
             return
+
+        # Replace the heavy image payload with a text marker so later turns
+        # don't resend hundreds of KB of base64 on every request.
+        self._strip_image(session, text, image)
 
         # Persist assistant turn into history for multi-turn memory.
         session.messages.append({"role": "assistant", "content": accumulated})
@@ -253,6 +272,14 @@ class SessionManager:
 
         yield {"type": "result", "result": accumulated,
                "session_id": session.session_id}
+
+    @staticmethod
+    def _strip_image(session: AssistantSession, text: str, image: str | None):
+        """Swap this turn's multimodal content for a cheap text marker."""
+        if image and session.messages and isinstance(
+            session.messages[-1].get("content"), list
+        ):
+            session.messages[-1]["content"] = f"{text} [사진 첨부됨]"
 
     # ── Persistence ──
 

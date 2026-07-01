@@ -410,6 +410,7 @@ class WhisperFlowWSServer:
         """chat_input: 별도 스레드에서 스트리밍 → 해당 클라이언트에만 전송."""
         tab_id = data.get("tab_id", "")
         text = data.get("text", "")
+        image = data.get("image")  # optional data URL for vision
 
         if not tab_id or not text:
             await websocket.send(json.dumps({
@@ -434,7 +435,7 @@ class WhisperFlowWSServer:
             # Reset streaming buffer for this tab
             self._streaming_buffers[tab_id] = ""
             try:
-                for chunk in session_manager.send_stream(tab_id, text):
+                for chunk in session_manager.send_stream(tab_id, text, image=image):
                     chunk_type = chunk.get("type", "")
                     content = ""
 

@@ -2630,6 +2630,12 @@
             <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
           </svg>
         </button>
+        <button class="chat-slide-mic-btn" id="chatCameraBtn" title="Camera (vision)" style="margin-right:4px;">
+          <svg viewBox="0 0 24 24" style="width:18px;height:18px;" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+            <circle cx="12" cy="13" r="4"/>
+          </svg>
+        </button>
         <textarea class="chat-slide-input" id="chatSlideInput" placeholder="Enter message..." rows="1"></textarea>
         <button class="chat-slide-mic-btn" id="chatSlideMicBtn" title="Voice Input">
           <svg viewBox="0 0 24 24">
@@ -4138,7 +4144,7 @@
         }
 
         case 'file_uploaded': {
-          handleFileUploaded(msg);
+          // Legacy macOS path — images now go inline via chat_input.image
           break;
         }
 
@@ -4846,16 +4852,20 @@
     // ---- Send Message ----
     function sendChatMessage() {
       const text = chatSlideInput.value.trim();
-      if ((!text && !pendingImagePath) || isStreaming) return;
+      if ((!text && !pendingImageData) || isStreaming) return;
 
-      addChatMessage('user', text);
-
-      // Include image path if attached - instruct Claude to use Read tool
-      let msgText = text;
-      if (pendingImagePath) {
-        const userMsg = text || '이 이미지를 분석해줘';
-        msgText = `다음 이미지 파일을 Read 도구로 열어서 분석해줘: ${pendingImagePath}\n\n${userMsg}`;
-        pendingImagePath = null;
+      // Linux port: images go straight to the vision model as a data URL
+      // (the old path saved to a macOS folder and asked for a Read tool
+      // the API backend doesn't have).
+      const msg = {
+        type: 'chat_input',
+        tab_id: ASSISTANT_TAB_ID,
+        text: text || (pendingImageData ? '이 사진에 보이는 걸 설명해줘' : ''),
+      };
+      addChatMessage('user', (pendingImageData ? '📷 ' : '') + msg.text);
+      if (pendingImageData) {
+        msg.image = pendingImageData;
+        pendingImageData = null;
         chatAttachPreview.style.display = 'none';
         chatFileInput.value = '';
       }
@@ -4864,11 +4874,7 @@
       setUIState('thinking');
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: 'state', value: 'thinking' }));
-        ws.send(JSON.stringify({
-          type: 'chat_input',
-          tab_id: ASSISTANT_TAB_ID,
-          text: msgText
-        }));
+        ws.send(JSON.stringify(msg));
       }
 
       chatSlideInput.value = '';
@@ -4918,17 +4924,47 @@
       }
     });
 
-    // ---- File Attach ----
-    let pendingImagePath = null;
+    // ---- Image Attach & Camera (vision) ----
+    // Both paths produce a downscaled JPEG data URL in pendingImageData,
+    // sent inline with chat_input for GPT-4o vision analysis.
+    let pendingImageData = null;
     const chatFileInput = $('chatFileInput');
     const chatAttachBtn = $('chatAttachBtn');
     const chatAttachPreview = $('chatAttachPreview');
     const chatAttachImg = $('chatAttachImg');
     const chatAttachRemove = $('chatAttachRemove');
+    const chatCameraBtn = $('chatCameraBtn');
+
+    function setPendingImage(dataUrl) {
+      pendingImageData = dataUrl;
+      chatAttachImg.src = dataUrl;
+      chatAttachPreview.style.display = 'flex';
+    }
+
+    // Downscale to ≤1280px JPEG so the WS message and vision tokens stay small.
+    function shrinkImage(srcDataUrlOrVideo, cb) {
+      const MAXDIM = 1280;
+      const draw = (w, h, drawFn) => {
+        const scale = Math.min(1, MAXDIM / Math.max(w, h));
+        const c = document.createElement('canvas');
+        c.width = Math.round(w * scale); c.height = Math.round(h * scale);
+        drawFn(c.getContext('2d'), c.width, c.height);
+        cb(c.toDataURL('image/jpeg', 0.85));
+      };
+      if (typeof srcDataUrlOrVideo === 'string') {
+        const img = new Image();
+        img.onload = () => draw(img.naturalWidth, img.naturalHeight,
+          (ctx, w, h) => ctx.drawImage(img, 0, 0, w, h));
+        img.src = srcDataUrlOrVideo;
+      } else { // video element
+        const v = srcDataUrlOrVideo;
+        draw(v.videoWidth, v.videoHeight, (ctx, w, h) => ctx.drawImage(v, 0, 0, w, h));
+      }
+    }
 
     chatAttachBtn.addEventListener('click', () => chatFileInput.click());
     chatAttachRemove.addEventListener('click', () => {
-      pendingImagePath = null;
+      pendingImageData = null;
       chatAttachPreview.style.display = 'none';
       chatFileInput.value = '';
     });
@@ -4936,30 +4972,60 @@
     chatFileInput.addEventListener('change', (e) => {
       const file = e.target.files[0];
       if (!file) return;
-
       const reader = new FileReader();
-      reader.onload = (ev) => {
-        const dataUrl = ev.target.result;
-        // Show preview
-        chatAttachImg.src = dataUrl;
-        chatAttachPreview.style.display = 'flex';
-
-        // Upload via WebSocket
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            type: 'file_upload',
-            filename: file.name,
-            data: dataUrl,
-          }));
-        }
-      };
+      reader.onload = (ev) => shrinkImage(ev.target.result, setPendingImage);
       reader.readAsDataURL(file);
     });
 
-    // Handle upload response
-    function handleFileUploaded(data) {
-      pendingImagePath = data.path;
+    // Camera: overlay preview, tap the video (or 📸) to capture & auto-send.
+    let camStream = null, camOverlay = null;
+    function closeCamera() {
+      if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+      if (camOverlay) { camOverlay.remove(); camOverlay = null; }
     }
+    async function openCamera() {
+      try {
+        camStream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: 'environment', width: { ideal: 1280 } }
+        });
+      } catch (e) {
+        alert('카메라 접근이 거부되었습니다: ' + e.message);
+        return;
+      }
+      camOverlay = document.createElement('div');
+      camOverlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,10,20,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;';
+      const video = document.createElement('video');
+      video.autoplay = true; video.playsInline = true; video.muted = true;
+      video.style.cssText = 'max-width:92vw;max-height:70vh;border:1px solid rgba(0,229,255,.5);border-radius:8px;';
+      video.srcObject = camStream;
+      const hint = document.createElement('div');
+      hint.textContent = '화면을 탭하면 촬영 후 바로 자비스에게 보냅니다';
+      hint.style.cssText = 'color:#7fdcff;font:13px monospace;';
+      const row = document.createElement('div');
+      row.style.cssText = 'display:flex;gap:12px;';
+      const shot = document.createElement('button');
+      shot.textContent = '📸 촬영';
+      const cancel = document.createElement('button');
+      cancel.textContent = '✕ 닫기';
+      [shot, cancel].forEach(b => b.style.cssText =
+        'padding:10px 22px;background:rgba(0,229,255,.15);color:#aef;border:1px solid rgba(0,229,255,.5);border-radius:6px;font:14px monospace;cursor:pointer;');
+      const capture = () => {
+        shrinkImage(video, (dataUrl) => {
+          closeCamera();
+          setPendingImage(dataUrl);
+          sendChatMessage(); // auto-send with typed text or default question
+        });
+      };
+      video.addEventListener('click', capture);
+      shot.addEventListener('click', capture);
+      cancel.addEventListener('click', closeCamera);
+      row.append(shot, cancel);
+      camOverlay.append(video, hint, row);
+      document.body.appendChild(camOverlay);
+    }
+    chatCameraBtn.addEventListener('click', () => {
+      if (camOverlay) closeCamera(); else openCamera();
+    });
 
     // ---- Event Listeners ----
     chatSlideToggle.addEventListener('click', toggleChatPanel);
