@@ -39,6 +39,13 @@ class SpeechToText:
                 self._model = WhisperModel(size, device="cpu", compute_type="int8")
             return self._model
 
+    def preload(self):
+        """Load the model ahead of the first request (call at server start)."""
+        try:
+            self._ensure_model()
+        except Exception as e:  # missing dep/network — first request will retry
+            print(f"[STT] preload failed (will lazy-load): {e}")
+
     def transcribe_bytes(self, audio: bytes, suffix: str = ".webm") -> str:
         """Transcribe raw audio bytes → text. Returns "" on failure."""
         if not audio:
@@ -60,8 +67,14 @@ class SpeechToText:
         model = self._ensure_model()
         lang_cfg = os.environ.get("WHISPER_LANGUAGE", "ko").strip()
         language = None if lang_cfg in ("", "auto") else lang_cfg
+        # beam_size=1 (greedy) is ~2x faster on CPU; short voice commands
+        # rarely benefit from beam search. Override with WHISPER_BEAM_SIZE.
+        try:
+            beam = int(os.environ.get("WHISPER_BEAM_SIZE", "1"))
+        except ValueError:
+            beam = 1
         segments, _info = model.transcribe(
-            path, language=language, beam_size=5, vad_filter=False
+            path, language=language, beam_size=beam, vad_filter=False
         )
         text = "".join(seg.text for seg in segments).strip()
         # Match the original formatting: newline after sentence enders.

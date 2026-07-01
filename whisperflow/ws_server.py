@@ -109,12 +109,11 @@ class WhisperFlowWSServer:
     def _serve_static(self, path: str, user_agent: str = "") -> Response:
         """Return an HTTP Response for a static file request."""
         if path == "/":
-            # Auto-detect mobile → assistant.html, PC → jarvis.html
-            ua = user_agent.lower()
-            if any(m in ua for m in ('iphone', 'android', 'mobile')):
-                path = "/assistant.html"
-            else:
-                path = "/jarvis.html"
+            # Linux port: serve the JARVIS particle UI to every device.
+            # jarvis.html is responsive (isMobileView handles the phone
+            # layout + Web Speech mic); the old chat-only assistant.html
+            # stays reachable at /assistant.html for anyone who wants it.
+            path = "/jarvis.html"
 
         # Strip query string
         path = path.split("?", 1)[0]
