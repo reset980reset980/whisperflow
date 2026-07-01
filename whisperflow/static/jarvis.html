@@ -4582,10 +4582,29 @@
     //  MIC BUTTON
     // ============================================================
     if (micButton) {
+      // Linux port: the main particle-UI mic button records in-browser too
+      // (the macOS-only server-side 'remote_record' path was removed).
+      // Helpers below are hoisted/assigned before any click fires.
       micButton.addEventListener('click', () => {
         unlockTtsAudio();
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'remote_record', value: 'toggle' }));
+        // Interrupt any ongoing TTS playback first.
+        if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
+          stopTtsPlayback();
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'tts_interrupt' }));
+          }
+        }
+        if (isMobileView) {
+          if (!webSpeechRecognition) webSpeechRecognition = initWebSpeech();
+          if (!webSpeechRecognition) {
+            alert('이 브라우저에서 음성 인식이 지원되지 않습니다.');
+            return;
+          }
+          if (webSpeechActive) stopWebSpeech();
+          else { try { webSpeechRecognition.start(); } catch (e) {} }
+        } else {
+          if (browserMicActive) stopBrowserMic();
+          else startBrowserMic();
         }
       });
     }
