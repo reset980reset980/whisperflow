@@ -5078,6 +5078,74 @@
       ttsAudioPlaying = false;
     }
 
+    // ---- Desktop browser-mic recorder (Linux port) ----
+    // The macOS build recorded on the server ('remote_record'); the Linux
+    // web server has no mic, so the browser captures audio via MediaRecorder
+    // and uploads it ('audio_upload') for server-side faster-whisper STT.
+    let mediaRecorder = null;
+    let mediaStream = null;
+    let recordedChunks = [];
+    let browserMicActive = false;
+
+    async function startBrowserMic() {
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        alert('마이크 접근이 거부되었습니다: ' + e.message);
+        setUIState('idle');
+        return;
+      }
+      recordedChunks = [];
+      let mime = '';
+      if (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+        mime = 'audio/webm;codecs=opus';
+      } else if (window.MediaRecorder && MediaRecorder.isTypeSupported('audio/webm')) {
+        mime = 'audio/webm';
+      }
+      try {
+        mediaRecorder = mime
+          ? new MediaRecorder(mediaStream, { mimeType: mime })
+          : new MediaRecorder(mediaStream);
+      } catch (e) {
+        alert('이 브라우저는 녹음을 지원하지 않습니다: ' + e.message);
+        if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        setUIState('idle');
+        return;
+      }
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+      };
+      mediaRecorder.onstop = () => {
+        const type = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
+        const blob = new Blob(recordedChunks, { type });
+        if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        if (!blob.size) { setUIState('idle'); return; }
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'audio_upload',
+              tab_id: ASSISTANT_TAB_ID,
+              suffix: '.webm',
+              data: reader.result,   // data URL (base64)
+            }));
+          }
+        };
+        reader.readAsDataURL(blob);
+      };
+      mediaRecorder.start();
+      browserMicActive = true;
+      setUIState('recording');
+    }
+
+    function stopBrowserMic() {
+      browserMicActive = false;
+      if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+        setUIState('processing');
+        try { mediaRecorder.stop(); } catch (e) {}
+      }
+    }
+
     chatSlideMicBtn.addEventListener('click', () => {
       unlockTtsAudio();
 
@@ -5117,9 +5185,11 @@
           try { webSpeechRecognition.start(); } catch(e) {}
         }
       } else {
-        // Desktop: use WhisperFlow remote_record (Mac mic)
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'remote_record', value: 'toggle' }));
+        // Desktop (Linux port): capture browser mic → audio_upload → STT
+        if (browserMicActive) {
+          stopBrowserMic();
+        } else {
+          startBrowserMic();
         }
       }
     });

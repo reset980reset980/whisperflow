@@ -25,7 +25,13 @@ from whisperflow.assistant_session import session_manager
 
 logger = logging.getLogger(__name__)
 
-WS_PORT = 8767
+# Host/port are configurable via env for the Linux port (Caddy proxies to
+# these). Defaults preserve the original macOS behaviour (localhost:8767).
+WS_HOST = os.environ.get("WHISPERFLOW_HOST", "127.0.0.1")
+try:
+    WS_PORT = int(os.environ.get("WHISPERFLOW_PORT", "8767"))
+except ValueError:
+    WS_PORT = 8767
 
 
 class WhisperFlowWSServer:
@@ -46,6 +52,9 @@ class WhisperFlowWSServer:
         self._on_conversation_continue = None
         self._on_chat_tts = None  # 콜백: app.py에서 채팅 응답 TTS 실행용
         self._on_tts_interrupt = None
+        # 콜백: 브라우저 마이크 오디오 → 텍스트 (Linux 포트, server.py에서 등록)
+        # 시그니처: transcribe(audio_bytes: bytes, suffix: str) -> str
+        self._transcribe = None
         # Hue 조명 제어
         self._hue = HueController()
         # Chat message persistence
@@ -224,6 +233,9 @@ class WhisperFlowWSServer:
                     if msg_type == "file_upload":
                         await self._handle_file_upload(websocket, data)
                         continue
+                    if msg_type == "audio_upload":
+                        await self._handle_audio_upload(websocket, data)
+                        continue
                     if msg_type == "session_model_change":
                         tab_id = data.get("tab_id", "")
                         model = data.get("model", "haiku")
@@ -329,6 +341,67 @@ class WhisperFlowWSServer:
                 "tab_id": "",
                 "error": f"Upload failed: {e}",
             }))
+
+    # ------------------------------------------------------------------
+    # Audio upload handler (Linux port: browser mic → server STT → chat)
+    # ------------------------------------------------------------------
+
+    async def _handle_audio_upload(self, websocket, data: dict):
+        """Decode browser-recorded audio, transcribe, then run the chat flow.
+
+        Broadcasts state=processing, the recognized transcript, and finally
+        streams the AI response (which triggers TTS) exactly like a typed
+        chat_input.
+        """
+        import base64
+
+        tab_id = data.get("tab_id", "") or "default"
+        suffix = data.get("suffix", ".webm")
+        b64 = data.get("data", "")
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+
+        if self._transcribe is None:
+            await websocket.send(json.dumps({
+                "type": "chat_error", "tab_id": tab_id,
+                "error": "STT backend not configured on server.",
+            }))
+            return
+
+        try:
+            audio = base64.b64decode(b64)
+        except Exception:
+            audio = b""
+        if not audio:
+            await websocket.send(json.dumps({
+                "type": "chat_error", "tab_id": tab_id,
+                "error": "Empty audio upload.",
+            }))
+            return
+
+        await self._broadcast(json.dumps({"type": "state", "value": "processing"}))
+
+        loop = self._loop
+        try:
+            text = await loop.run_in_executor(
+                None, self._transcribe, audio, suffix
+            )
+        except Exception as e:
+            logger.error("STT error: %s", e)
+            text = ""
+        text = (text or "").strip()
+
+        if not text:
+            await self._broadcast(json.dumps({"type": "state", "value": "idle"}))
+            await websocket.send(json.dumps({
+                "type": "chat_error", "tab_id": tab_id,
+                "error": "음성을 인식하지 못했습니다.",
+            }))
+            return
+
+        # Show the recognized text in the UI, then feed it to the AI.
+        await self._broadcast(json.dumps({"type": "transcript", "value": text}))
+        await self._handle_chat_input(websocket, {"tab_id": tab_id, "text": text})
 
     # ------------------------------------------------------------------
     # Chat & Session handlers (unicast to requesting client)
@@ -511,7 +584,7 @@ class WhisperFlowWSServer:
         try:
             async with websockets.serve(
                 self._handler,
-                "127.0.0.1",
+                WS_HOST,
                 WS_PORT,
                 process_request=self._process_request,
                 max_size=10 * 1024 * 1024,  # 10MB for browser screenshots

@@ -1,3 +1,10 @@
+# Secrets (NEVER commit) ─ Linux port
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
 # Python
 __pycache__/
 *.py[cod]
@@ -5,7 +12,15 @@ __pycache__/
 *.so
 .Python
 venv/
+.venv/
+env/
 ENV/
+
+# Whisper / model caches
+models/*.bin
+models/*.pt
+*.wav
+!whisperflow/static/sounds/*.wav
 
 # macOS
 .DS_Store
@@ -45,6 +60,7 @@ whisperflow_windows/
 
 # Claude Code (로컬 설정 + worktree)
 .claude/
+.omc/
 
 # YOLO 모델 가중치 (ultralytics 자동 다운로드, 커밋 불필요)
 *.pt

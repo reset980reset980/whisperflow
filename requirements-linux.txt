@@ -1,0 +1,14 @@
+# WhisperFlow — Linux (headless web server) dependencies.
+# The macOS desktop app deps (rumps, pynput, pyobjc, sounddevice, pyperclip)
+# are NOT needed here; the browser handles mic capture and playback.
+
+# WebSocket + static HTTP server. ws_server.py uses the websockets 13.x
+# process_request/http11 API, so pin to that series.
+websockets>=13.0,<15.0
+
+# Speech-to-text (local, offline). Pulls ctranslate2 + PyAV; PyAV uses the
+# system ffmpeg to decode browser-recorded webm/opus.
+faster-whisper>=1.0.0
+
+# Envelope analysis for the speaking-particle audio_level stream.
+numpy>=1.24.0
