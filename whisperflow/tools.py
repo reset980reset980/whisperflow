@@ -196,6 +196,51 @@ def search_wikipedia(query: str) -> str:
         return f"위키백과 검색 실패: {e}"
 
 
+_NAVER_CATEGORIES = {
+    "web": "webkr", "news": "news", "blog": "blog",
+    "local": "local", "shop": "shop", "book": "book",
+}
+
+
+def _strip_tags(s: str) -> str:
+    return re.sub(r"<[^>]+>", "", s).replace("&quot;", '"').replace("&amp;", "&")
+
+
+def naver_search(query: str, category: str = "web") -> str:
+    cid = os.environ.get("NAVER_CLIENT_ID", "").strip()
+    csec = os.environ.get("NAVER_CLIENT_SECRET", "").strip()
+    if not cid or not csec:
+        return "네이버 검색 API 키가 설정되어 있지 않습니다."
+    endpoint = _NAVER_CATEGORIES.get(category.strip().lower(), "webkr")
+    try:
+        url = (f"https://openapi.naver.com/v1/search/{endpoint}.json?"
+               + urllib.parse.urlencode({"query": query, "display": 5}))
+        req = urllib.request.Request(url, headers={
+            **_UA,
+            "X-Naver-Client-Id": cid,
+            "X-Naver-Client-Secret": csec,
+        })
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        items = data.get("items") or []
+        if not items:
+            return f"'{query}' 검색 결과가 없습니다."
+        lines = []
+        for it in items:
+            title = _strip_tags(it.get("title", ""))
+            if endpoint == "local":
+                extra = f" — {it.get('roadAddress') or it.get('address', '')} ({it.get('category', '')})"
+            elif endpoint == "shop":
+                extra = f" — {int(it.get('lprice', 0)):,}원 ({it.get('mallName', '')})"
+            else:
+                desc = _strip_tags(it.get("description", ""))[:80]
+                extra = f" — {desc}" if desc else ""
+            lines.append(f"- {title}{extra}")
+        return f"네이버 {category} 검색 결과 ({data.get('total', '?')}건 중 상위):\n" + "\n".join(lines)
+    except Exception as e:
+        return f"네이버 검색 실패: {e}"
+
+
 def save_memo(content: str, title: str = "") -> str:
     try:
         VAULT_INBOX.mkdir(parents=True, exist_ok=True)
@@ -258,6 +303,17 @@ TOOL_SCHEMAS = [
         }, "required": ["query"]},
     }},
     {"type": "function", "function": {
+        "name": "naver_search",
+        "description": ("네이버에서 실시간 검색한다. 일반 정보는 web, 맛집·가게·장소는 local, "
+                        "최신 소식은 news, 후기·리뷰는 blog, 상품 가격은 shop, 책은 book."),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "검색어"},
+            "category": {"type": "string",
+                         "enum": ["web", "news", "blog", "local", "shop", "book"],
+                         "description": "검색 종류 (기본 web)"},
+        }, "required": ["query"]},
+    }},
+    {"type": "function", "function": {
         "name": "save_memo",
         "description": "사용자가 말한 내용을 Obsidian 노트(메모)로 저장한다. '메모해줘', '기억해줘', '적어줘' 요청 시 사용.",
         "parameters": {"type": "object", "properties": {
@@ -274,6 +330,7 @@ _IMPLS = {
     "get_server_status": get_server_status,
     "search_news": search_news,
     "search_wikipedia": search_wikipedia,
+    "naver_search": naver_search,
     "save_memo": save_memo,
 }
 
