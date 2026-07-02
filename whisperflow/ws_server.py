@@ -26,28 +26,6 @@ from whisperflow.assistant_session import session_manager
 logger = logging.getLogger(__name__)
 
 
-def _looks_like_vision_request(text: str) -> bool:
-    compact = "".join((text or "").split())
-    return any(
-        key in compact
-        for key in (
-            "내가보",
-            "나보",
-            "보이",
-            "카메라",
-            "화면",
-            "사진",
-            "이미지",
-            "스크린샷",
-            "이거",
-            "저거",
-            "이문서",
-            "지금이거",
-            "앞에",
-            "얼굴",
-        )
-    )
-
 
 # Host/port are configurable via env for the Linux port (Caddy proxies to
 # these). Defaults preserve the original macOS behaviour (localhost:8767).
@@ -462,7 +440,10 @@ class WhisperFlowWSServer:
             flush=True,
         )
 
-        if not image and (expect_image or _looks_like_vision_request(text)):
+        # Reject only when the client explicitly promised a frame (live
+        # mode on) but none arrived. Keyword guessing is NOT used here:
+        # everyday words like '이거'/'화면' would block normal chat.
+        if not image and expect_image:
             await websocket.send(json.dumps({
                 "type": "chat_error",
                 "tab_id": tab_id,

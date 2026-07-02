@@ -4846,25 +4846,18 @@
     // ---- Send Message ----
     let chatSendInFlight = false;
 
-    function isVisionQuestion(text) {
-      const compact = (text || '').replace(/\s+/g, '');
-      return [
-        '내가보', '나보', '보이', '카메라', '화면', '사진', '이미지',
-        '스크린샷', '이거', '저거', '이문서', '지금이거', '앞에', '얼굴'
-      ].some(k => compact.includes(k));
-    }
-
     async function sendChatMessage() {
       if (chatSendInFlight) return;
       const text = chatSlideInput.value.trim();
       const hadPendingImage = !!pendingImageData;
       let imageForTurn = pendingImageData;
-      const expectsVision = hadPendingImage || liveVisionOn || isVisionQuestion(text);
+      // A frame is only "expected" when the user attached one or live mode
+      // is on. No keyword guessing — words like '이거'/'화면' appear in
+      // ordinary chat and must never block sending.
+      const expectsVision = hadPendingImage || liveVisionOn;
       if (!imageForTurn && liveVisionOn) imageForTurn = await captureLiveFrameForTurn(1800);
-      if (!imageForTurn && expectsVision) {
-        const msg = liveVisionOn
-          ? '카메라 영상이 아직 준비되지 않았습니다. 프리뷰가 움직이는지 확인한 뒤 다시 말해주세요.'
-          : '카메라가 켜져 있지 않습니다. 📷 버튼으로 LIVE를 켠 뒤 다시 말해주세요.';
+      if (!imageForTurn && liveVisionOn) {
+        const msg = '카메라 영상이 아직 준비되지 않았습니다. 프리뷰가 움직이는지 확인한 뒤 다시 말해주세요.';
         addChatMessage('error', msg);
         pipSay(msg);
         return;
@@ -5633,10 +5626,9 @@
             };
             const liveFrame = liveVisionOn ? captureFrameSync() : null;
             if (liveFrame) msg.image = liveFrame;
-            if (liveVisionOn) {
-              msg.expect_image = true;
-              if (!liveFrame) pipSay('카메라 프레임 없이 음성이 전송되었습니다');
-            }
+            // No expect_image here: if the frame capture failed the voice
+            // message must still go through as plain audio, not be bounced.
+            if (liveVisionOn && !liveFrame) pipSay('카메라 프레임 없이 음성이 전송되었습니다');
             ws.send(JSON.stringify(msg));
           }
         };
