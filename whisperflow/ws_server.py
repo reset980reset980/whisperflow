@@ -357,6 +357,7 @@ class WhisperFlowWSServer:
         tab_id = data.get("tab_id", "") or "default"
         suffix = data.get("suffix", ".webm")
         b64 = data.get("data", "")
+        image = data.get("image")
         if "," in b64:
             b64 = b64.split(",", 1)[1]
 
@@ -400,7 +401,9 @@ class WhisperFlowWSServer:
 
         # Show the recognized text in the UI, then feed it to the AI.
         await self._broadcast(json.dumps({"type": "transcript", "value": text}))
-        await self._handle_chat_input(websocket, {"tab_id": tab_id, "text": text})
+        await self._handle_chat_input(
+            websocket, {"tab_id": tab_id, "text": text, "image": image}
+        )
 
     # ------------------------------------------------------------------
     # Chat & Session handlers (unicast to requesting client)

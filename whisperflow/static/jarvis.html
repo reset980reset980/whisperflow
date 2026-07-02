@@ -3813,14 +3813,11 @@
             if (newState === 'recording') {
               showListening();
               // Mobile: TTS 재생 완료 후 Web Speech 시작
-              if (isMobileView && !webSpeechActive) {
+              if (isMobileView && !voiceCaptureActive()) {
                 if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
                   _pendingListenAfterTts = true;
                 } else {
-                  if (!webSpeechRecognition) webSpeechRecognition = initWebSpeech();
-                  if (webSpeechRecognition) {
-                    try { webSpeechRecognition.start(); } catch(e) {}
-                  }
+                  startVoiceCapture();
                 }
               }
             } else if (newState === 'processing') {
@@ -4601,13 +4598,8 @@
           }
         }
         if (isMobileView) {
-          if (!webSpeechRecognition) webSpeechRecognition = initWebSpeech();
-          if (!webSpeechRecognition) {
-            alert('이 브라우저에서 음성 인식이 지원되지 않습니다.');
-            return;
-          }
-          if (webSpeechActive) stopWebSpeech();
-          else { try { webSpeechRecognition.start(); } catch (e) {} }
+          if (voiceCaptureActive()) stopVoiceCapture();
+          else startVoiceCapture();
         } else {
           if (browserMicActive) stopBrowserMic();
           else startBrowserMic();
@@ -4852,7 +4844,10 @@
     // ---- Send Message ----
     function sendChatMessage() {
       const text = chatSlideInput.value.trim();
-      if ((!text && !pendingImageData) || isStreaming) return;
+      const hadPendingImage = !!pendingImageData;
+      let imageForTurn = pendingImageData;
+      if (!imageForTurn && liveVisionOn) imageForTurn = captureFrameSync();
+      if ((!text && !imageForTurn) || isStreaming) return;
 
       // Linux port: images go straight to the vision model as a data URL
       // (the old path saved to a macOS folder and asked for a Read tool
@@ -4860,14 +4855,16 @@
       const msg = {
         type: 'chat_input',
         tab_id: ASSISTANT_TAB_ID,
-        text: text || (pendingImageData ? '이 사진에 보이는 걸 설명해줘' : ''),
+        text: text || (imageForTurn ? '이 사진에 보이는 걸 설명해줘' : ''),
       };
-      addChatMessage('user', (pendingImageData ? '📷 ' : '') + msg.text);
-      if (pendingImageData) {
-        msg.image = pendingImageData;
-        pendingImageData = null;
-        chatAttachPreview.style.display = 'none';
-        chatFileInput.value = '';
+      addChatMessage('user', (imageForTurn ? '📷 ' : '') + msg.text);
+      if (imageForTurn) {
+        msg.image = imageForTurn;
+        if (hadPendingImage) {
+          pendingImageData = null;
+          chatAttachPreview.style.display = 'none';
+          chatFileInput.value = '';
+        }
       }
 
       // HUD state: thinking + mobile arc reactor glow
@@ -4977,55 +4974,270 @@
       reader.readAsDataURL(file);
     });
 
-    // Camera: overlay preview, tap the video (or 📸) to capture & auto-send.
-    let camStream = null, camOverlay = null;
-    function closeCamera() {
-      if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
-      if (camOverlay) { camOverlay.remove(); camOverlay = null; }
+    // ================================================================
+    //  LIVE VISION — PiP camera + gestures (MediaPipe) + faces (face-api)
+    //  While live mode is ON:
+    //   · every question (typed or voice) auto-attaches the current frame
+    //   · gestures: ✋ Open_Palm = start recording, ✊ Closed_Fist = stop /
+    //     interrupt TTS, ✌️ Victory = analyze current view
+    //   · registered faces are recognized and greeted by name
+    //  All inference runs in the browser; failures degrade gracefully.
+    // ================================================================
+    let liveVisionOn = false;
+    let camStream = null, camVideo = null, camPip = null;
+    let gestureRecognizer = null, gestureRAF = null, lastGestureAction = 0;
+    let faceReady = false, faceTimer = null, lastGreeted = {};
+    let pipStatus = null, pipFaceLabel = null;
+    let cameraFacingMode = isMobileView ? 'environment' : 'user';
+
+    function captureFrameSync() {
+      if (!camVideo || !camVideo.videoWidth) return null;
+      const MAXDIM = 1280;
+      const scale = Math.min(1, MAXDIM / Math.max(camVideo.videoWidth, camVideo.videoHeight));
+      const c = document.createElement('canvas');
+      c.width = Math.round(camVideo.videoWidth * scale);
+      c.height = Math.round(camVideo.videoHeight * scale);
+      c.getContext('2d').drawImage(camVideo, 0, 0, c.width, c.height);
+      return c.toDataURL('image/jpeg', 0.85);
     }
-    async function openCamera() {
+
+    function pipSay(msg) { if (pipStatus) pipStatus.textContent = msg; }
+
+    function stopLiveVision() {
+      liveVisionOn = false;
+      if (gestureRAF) { cancelAnimationFrame(gestureRAF); gestureRAF = null; }
+      if (faceTimer) { clearInterval(faceTimer); faceTimer = null; }
+      if (camStream) { camStream.getTracks().forEach(t => t.stop()); camStream = null; }
+      if (camPip) { camPip.remove(); camPip = null; }
+      camVideo = null;
+      pipStatus = null;
+      pipFaceLabel = null;
+      chatCameraBtn.classList.remove('recording');
+    }
+
+    async function startLiveVision() {
       try {
         camStream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment', width: { ideal: 1280 } }
+          video: { facingMode: { ideal: cameraFacingMode }, width: { ideal: 960 } }
         });
       } catch (e) {
         alert('카메라 접근이 거부되었습니다: ' + e.message);
         return;
       }
-      camOverlay = document.createElement('div');
-      camOverlay.style.cssText = 'position:fixed;inset:0;z-index:9999;background:rgba(0,10,20,.92);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;';
-      const video = document.createElement('video');
-      video.autoplay = true; video.playsInline = true; video.muted = true;
-      video.style.cssText = 'max-width:92vw;max-height:70vh;border:1px solid rgba(0,229,255,.5);border-radius:8px;';
-      video.srcObject = camStream;
-      const hint = document.createElement('div');
-      hint.textContent = '화면을 탭하면 촬영 후 바로 자비스에게 보냅니다';
-      hint.style.cssText = 'color:#7fdcff;font:13px monospace;';
+      liveVisionOn = true;
+      chatCameraBtn.classList.add('recording');
+
+      camPip = document.createElement('div');
+      camPip.style.cssText = 'position:fixed;right:12px;bottom:86px;z-index:9500;width:216px;'
+        + 'background:rgba(2,12,22,.9);border:1px solid rgba(0,229,255,.45);border-radius:10px;'
+        + 'padding:6px;display:flex;flex-direction:column;gap:5px;font:11px monospace;color:#8fe8ff;';
+      camVideo = document.createElement('video');
+      camVideo.autoplay = true; camVideo.playsInline = true; camVideo.muted = true;
+      camVideo.style.cssText = 'width:100%;border-radius:6px;transform:scaleX(-1);';
+      camVideo.srcObject = camStream;
+
+      pipFaceLabel = document.createElement('div');
+      pipFaceLabel.style.cssText = 'min-height:13px;color:#7dffb0;text-align:center;';
+      pipStatus = document.createElement('div');
+      pipStatus.style.cssText = 'min-height:13px;text-align:center;opacity:.85;';
+      pipStatus.textContent = 'LIVE — 질문하면 현재 화면이 함께 전송됩니다';
+
       const row = document.createElement('div');
-      row.style.cssText = 'display:flex;gap:12px;';
-      const shot = document.createElement('button');
-      shot.textContent = '📸 촬영';
-      const cancel = document.createElement('button');
-      cancel.textContent = '✕ 닫기';
-      [shot, cancel].forEach(b => b.style.cssText =
-        'padding:10px 22px;background:rgba(0,229,255,.15);color:#aef;border:1px solid rgba(0,229,255,.5);border-radius:6px;font:14px monospace;cursor:pointer;');
-      const capture = () => {
-        shrinkImage(video, (dataUrl) => {
-          closeCamera();
-          setPendingImage(dataUrl);
-          sendChatMessage(); // auto-send with typed text or default question
-        });
+      row.style.cssText = 'display:flex;gap:5px;justify-content:center;';
+      const mkBtn = (label, title, fn) => {
+        const b = document.createElement('button');
+        b.textContent = label; b.title = title;
+        b.style.cssText = 'flex:1;padding:5px 0;background:rgba(0,229,255,.12);color:#aef;'
+          + 'border:1px solid rgba(0,229,255,.4);border-radius:5px;cursor:pointer;font:12px monospace;';
+        b.addEventListener('click', fn);
+        return b;
       };
-      video.addEventListener('click', capture);
-      shot.addEventListener('click', capture);
-      cancel.addEventListener('click', closeCamera);
-      row.append(shot, cancel);
-      camOverlay.append(video, hint, row);
-      document.body.appendChild(camOverlay);
+      row.append(
+        mkBtn('📸', '지금 화면 분석', () => analyzeNow()),
+        mkBtn('↺', '전면/후면 카메라 전환', () => switchLiveCamera()),
+        mkBtn('😀등록', '얼굴 등록', () => registerFace()),
+        mkBtn('✕', '카메라 끄기', () => stopLiveVision()),
+      );
+      camPip.append(camVideo, pipFaceLabel, pipStatus, row);
+      document.body.appendChild(camPip);
+
+      initGestures();   // fire-and-forget; sets status on failure
+      initFaces();
     }
+
+    async function switchLiveCamera() {
+      cameraFacingMode = cameraFacingMode === 'user' ? 'environment' : 'user';
+      stopLiveVision();
+      await startLiveVision();
+    }
+
+    function analyzeNow() {
+      const frame = captureFrameSync();
+      if (!frame) return;
+      setPendingImage(frame);
+      if (!chatSlideInput.value.trim()) chatSlideInput.value = '지금 카메라에 보이는 걸 설명해줘';
+      sendChatMessage();
+    }
+
     chatCameraBtn.addEventListener('click', () => {
-      if (camOverlay) closeCamera(); else openCamera();
+      if (liveVisionOn) stopLiveVision(); else startLiveVision();
     });
+
+    // ---- Gestures (MediaPipe GestureRecognizer, built-in gesture set) ----
+    function startGestureLoop() {
+      if (gestureRAF) { cancelAnimationFrame(gestureRAF); gestureRAF = null; }
+      let lastTs = 0;
+      const loop = () => {
+        if (!liveVisionOn || !gestureRecognizer) return;
+        const now = performance.now();
+        if (now - lastTs > 200 && camVideo && camVideo.videoWidth) { // ~5fps
+          lastTs = now;
+          try {
+            const res = gestureRecognizer.recognizeForVideo(camVideo, now);
+            const g = res.gestures && res.gestures[0] && res.gestures[0][0];
+            if (g && g.score > 0.6) handleGesture(g.categoryName);
+          } catch (e) { /* single-frame failure: keep looping */ }
+        }
+        gestureRAF = requestAnimationFrame(loop);
+      };
+      gestureRAF = requestAnimationFrame(loop);
+    }
+
+    async function initGestures() {
+      try {
+        if (gestureRecognizer) {
+          pipSay('LIVE · ✋녹음 ✊중지 ✌️분석');
+          startGestureLoop();
+          return;
+        }
+        pipSay('제스처 모델 로딩중…');
+        const vision = await import('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14');
+        const files = await vision.FilesetResolver.forVisionTasks(
+          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+        gestureRecognizer = await vision.GestureRecognizer.createFromOptions(files, {
+          baseOptions: { modelAssetPath:
+            'https://storage.googleapis.com/mediapipe-models/gesture_recognizer/gesture_recognizer/float16/1/gesture_recognizer.task' },
+          runningMode: 'VIDEO', numHands: 1,
+        });
+        pipSay('LIVE · ✋녹음 ✊중지 ✌️분석');
+        startGestureLoop();
+      } catch (e) {
+        console.error('[Gesture] init failed:', e);
+        pipSay('제스처 사용 불가 (모델 로드 실패)');
+      }
+    }
+
+    function handleGesture(name) {
+      const now = Date.now();
+      if (now - lastGestureAction < 2500) return; // cooldown
+      if (name === 'Open_Palm' && !voiceCaptureActive() && !isStreaming) {
+        lastGestureAction = now;
+        pipSay('✋ 녹음 시작');
+        startVoiceCapture();
+      } else if (name === 'Closed_Fist') {
+        if (voiceCaptureActive()) {
+          lastGestureAction = now; pipSay('✊ 녹음 종료 → 전송'); stopVoiceCapture();
+        } else if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
+          lastGestureAction = now; pipSay('✊ 음성 중단');
+          stopTtsPlayback();
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'tts_interrupt' }));
+        }
+      } else if (name === 'Victory' && !isStreaming) {
+        lastGestureAction = now;
+        pipSay('✌️ 화면 분석');
+        analyzeNow();
+      }
+    }
+
+    // ---- Faces (face-api: register descriptors, recognize, greet) ----
+    function loadScript(src) {
+      return new Promise((ok, bad) => {
+        const s = document.createElement('script');
+        s.src = src; s.onload = ok; s.onerror = bad;
+        document.head.appendChild(s);
+      });
+    }
+
+    async function initFaces() {
+      try {
+        if (faceReady) {
+          if (!faceTimer) faceTimer = setInterval(recognizeFaceTick, 2500);
+          return;
+        }
+        if (!window.faceapi) {
+          await loadScript('https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js');
+        }
+        const MODELS = 'https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/model';
+        await Promise.all([
+          faceapi.nets.tinyFaceDetector.loadFromUri(MODELS),
+          faceapi.nets.faceLandmark68Net.loadFromUri(MODELS),
+          faceapi.nets.faceRecognitionNet.loadFromUri(MODELS),
+        ]);
+        faceReady = true;
+        faceTimer = setInterval(recognizeFaceTick, 2500);
+      } catch (e) {
+        console.error('[Face] init failed:', e);
+        if (pipFaceLabel) pipFaceLabel.textContent = '얼굴인식 사용 불가';
+      }
+    }
+
+    function getFaceDB() {
+      try { return JSON.parse(localStorage.getItem('jarvis_faces') || '{}'); }
+      catch (e) { return {}; }
+    }
+
+    async function getDescriptor() {
+      const det = await faceapi.detectSingleFace(
+        camVideo, new faceapi.TinyFaceDetectorOptions({ scoreThreshold: 0.4 })
+      ).withFaceLandmarks().withFaceDescriptor();
+      return det ? det.descriptor : null;
+    }
+
+    async function registerFace() {
+      if (!faceReady) { alert('얼굴인식 모델이 아직 준비되지 않았습니다.'); return; }
+      const name = prompt('등록할 이름을 입력하세요:');
+      if (!name) return;
+      pipSay('얼굴 캡처 중… 카메라를 정면으로 봐주세요');
+      const desc = await getDescriptor();
+      if (!desc) { pipSay('얼굴을 찾지 못했습니다. 다시 시도하세요.'); return; }
+      const db = getFaceDB();
+      (db[name] = db[name] || []).push(Array.from(desc));
+      if (db[name].length > 5) db[name] = db[name].slice(-5);
+      localStorage.setItem('jarvis_faces', JSON.stringify(db));
+      pipSay(`😀 '${name}' 등록 완료 (샘플 ${db[name].length}개)`);
+    }
+
+    async function recognizeFaceTick() {
+      if (!liveVisionOn || !faceReady || !camVideo || !camVideo.videoWidth) return;
+      const db = getFaceDB();
+      const names = Object.keys(db);
+      try {
+        const desc = await getDescriptor();
+        if (!desc) { pipFaceLabel.textContent = ''; return; }
+        if (!names.length) { pipFaceLabel.textContent = '👤 미등록 얼굴'; return; }
+        let best = null, bestDist = 1;
+        for (const n of names) {
+          for (const sample of db[n]) {
+            const d = faceapi.euclideanDistance(desc, new Float32Array(sample));
+            if (d < bestDist) { bestDist = d; best = n; }
+          }
+        }
+        if (best && bestDist < 0.5) {
+          pipFaceLabel.textContent = `👤 ${best} (${(1 - bestDist).toFixed(2)})`;
+          // Greet once per person per 10 minutes.
+          const t = lastGreeted[best] || 0;
+          if (Date.now() - t > 600000 && !isStreaming && ws && ws.readyState === WebSocket.OPEN) {
+            lastGreeted[best] = Date.now();
+            ws.send(JSON.stringify({
+              type: 'chat_input', tab_id: ASSISTANT_TAB_ID,
+              text: `(시스템: 카메라에 등록된 사용자 '${best}'가 방금 인식되었어. 짧게 이름을 부르며 인사해줘.)`,
+            }));
+          }
+        } else {
+          pipFaceLabel.textContent = '👤 미등록 얼굴';
+        }
+      } catch (e) { /* transient detector errors are fine */ }
+    }
 
     // ---- Event Listeners ----
     chatSlideToggle.addEventListener('click', toggleChatPanel);
@@ -5047,10 +5259,13 @@
 
     // ---- Mobile Web Speech API / Desktop remote_record ----
     let webSpeechActive = false;
+    let webSpeechStarting = false;
     let webSpeechRecognition = null;
     let silenceTimer = null;
     let manualStop = false;         // 사용자가 수동으로 멈춘 건지 구분
     let accumulatedText = '';       // continuous 모드에서 누적 텍스트
+    let finalTranscriptParts = [];  // Web Speech resultIndex별 final 텍스트
+    let webSpeechTurnSent = false;
     const SILENCE_TIMEOUT = 3000;   // 3초 무음 시 자동 종료
 
     function clearSilenceTimer() {
@@ -5070,6 +5285,7 @@
 
     function stopWebSpeech() {
       manualStop = true;
+      webSpeechStarting = false;
       clearSilenceTimer();
       if (webSpeechRecognition) {
         try { webSpeechRecognition.stop(); } catch(e) {}
@@ -5086,26 +5302,30 @@
       recognition.maxAlternatives = 1;
 
       recognition.onstart = () => {
+        webSpeechStarting = false;
         webSpeechActive = true;
         manualStop = false;
         accumulatedText = '';
+        finalTranscriptParts = [];
+        webSpeechTurnSent = false;
         setUIState('recording');
         startSilenceTimer();
       };
 
       recognition.onresult = (event) => {
-        let allFinal = '';
         let interim = '';
-        for (let i = 0; i < event.results.length; i++) {
+        const start = event.resultIndex || 0;
+        for (let i = start; i < event.results.length; i++) {
+          const transcript = event.results[i][0].transcript;
           if (event.results[i].isFinal) {
-            allFinal += event.results[i][0].transcript;
+            finalTranscriptParts[i] = transcript;
           } else {
-            interim += event.results[i][0].transcript;
+            interim += transcript;
           }
         }
-        accumulatedText = allFinal;
+        accumulatedText = finalTranscriptParts.filter(Boolean).join('');
         // Show combined text in input field
-        chatSlideInput.value = allFinal + (interim ? interim : '');
+        chatSlideInput.value = accumulatedText + (interim ? interim : '');
         // Scroll down to show latest wrapped line
         chatSlideInput.scrollTop = chatSlideInput.scrollHeight;
         // Reset silence timer on every new result
@@ -5116,22 +5336,29 @@
         if (!manualStop && webSpeechActive) {
           // iOS Safari가 자동으로 끊은 경우 — 재시작
           console.log('[WebSpeech] Browser stopped — auto-restarting');
+          webSpeechStarting = true;
           try { recognition.start(); } catch(e) {
+            webSpeechStarting = false;
             // 재시작 실패 시 종료 처리
             webSpeechActive = false;
             setUIState('idle');
             const text = chatSlideInput.value.trim();
-            if (text) sendChatMessage();
+            if (text && !webSpeechTurnSent) {
+              webSpeechTurnSent = true;
+              sendChatMessage();
+            }
           }
           return;
         }
         // 수동 종료 또는 무음 타이머 종료
         clearSilenceTimer();
+        webSpeechStarting = false;
         webSpeechActive = false;
         manualStop = false;
         setUIState('idle');
         const text = chatSlideInput.value.trim();
-        if (text) {
+        if (text && !webSpeechTurnSent) {
+          webSpeechTurnSent = true;
           sendChatMessage();
         } else if (ws && ws.readyState === WebSocket.OPEN) {
           // 음성 없이 종료 → 서버에 idle 알림
@@ -5144,12 +5371,41 @@
         // no-speech는 무시하고 계속 (자동 재시작됨)
         if (event.error === 'no-speech') return;
         clearSilenceTimer();
+        webSpeechStarting = false;
         webSpeechActive = false;
         manualStop = false;
         setUIState('idle');
       };
 
       return recognition;
+    }
+
+    function voiceCaptureActive() {
+      return isMobileView ? (webSpeechActive || webSpeechStarting) : browserMicActive;
+    }
+
+    function startVoiceCapture() {
+      if (isMobileView) {
+        if (!webSpeechRecognition) webSpeechRecognition = initWebSpeech();
+        if (!webSpeechRecognition) {
+          alert('이 브라우저에서 음성 인식이 지원되지 않습니다.');
+          return;
+        }
+        if (!webSpeechActive && !webSpeechStarting) {
+          webSpeechStarting = true;
+          try { webSpeechRecognition.start(); } catch(e) { webSpeechStarting = false; }
+        }
+      } else if (!browserMicActive) {
+        startBrowserMic();
+      }
+    }
+
+    function stopVoiceCapture() {
+      if (isMobileView) {
+        if (webSpeechActive) stopWebSpeech();
+      } else if (browserMicActive) {
+        stopBrowserMic();
+      }
     }
 
     function stopTtsPlayback() {
@@ -5171,10 +5427,94 @@
     let mediaStream = null;
     let recordedChunks = [];
     let browserMicActive = false;
+    let desktopMicAudioCtx = null;
+    let desktopMicAnalyser = null;
+    let desktopMicMonitorTimer = null;
+    let desktopMicData = null;
+    let desktopMicStartedAt = 0;
+    let desktopMicLastVoiceAt = 0;
+    let desktopMicHeardSpeech = false;
+    let desktopMicNoiseFloor = 0.012;
+    const DESKTOP_SILENCE_TIMEOUT = 1600;
+    const DESKTOP_MIN_RECORD_MS = 900;
+    const DESKTOP_MAX_RECORD_MS = 15000;
+
+    function stopDesktopVoiceMonitor() {
+      if (desktopMicMonitorTimer) {
+        clearInterval(desktopMicMonitorTimer);
+        desktopMicMonitorTimer = null;
+      }
+      if (desktopMicAudioCtx) {
+        try { desktopMicAudioCtx.close(); } catch(e) {}
+      }
+      desktopMicAudioCtx = null;
+      desktopMicAnalyser = null;
+      desktopMicData = null;
+      desktopMicHeardSpeech = false;
+    }
+
+    function startDesktopVoiceMonitor(stream) {
+      stopDesktopVoiceMonitor();
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) return;
+      try {
+        desktopMicAudioCtx = new AudioContext();
+        desktopMicAnalyser = desktopMicAudioCtx.createAnalyser();
+        desktopMicAnalyser.fftSize = 1024;
+        desktopMicData = new Uint8Array(desktopMicAnalyser.fftSize);
+        const src = desktopMicAudioCtx.createMediaStreamSource(stream);
+        src.connect(desktopMicAnalyser);
+        desktopMicStartedAt = Date.now();
+        desktopMicLastVoiceAt = desktopMicStartedAt;
+        desktopMicNoiseFloor = 0.012;
+        desktopMicMonitorTimer = setInterval(() => {
+          if (!browserMicActive || !desktopMicAnalyser || !desktopMicData) return;
+          desktopMicAnalyser.getByteTimeDomainData(desktopMicData);
+          let sum = 0;
+          for (let i = 0; i < desktopMicData.length; i++) {
+            const v = (desktopMicData[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / desktopMicData.length);
+          const now = Date.now();
+          const elapsed = now - desktopMicStartedAt;
+
+          if (elapsed < 500) {
+            desktopMicNoiseFloor = desktopMicNoiseFloor * 0.85 + rms * 0.15;
+            return;
+          }
+
+          const voiceThreshold = Math.max(0.014, desktopMicNoiseFloor * 2.5);
+          if (rms > voiceThreshold) {
+            desktopMicHeardSpeech = true;
+            desktopMicLastVoiceAt = now;
+          }
+
+          if (
+            desktopMicHeardSpeech &&
+            elapsed > DESKTOP_MIN_RECORD_MS &&
+            now - desktopMicLastVoiceAt > DESKTOP_SILENCE_TIMEOUT
+          ) {
+            stopBrowserMic('silence');
+          } else if (elapsed > DESKTOP_MAX_RECORD_MS) {
+            stopBrowserMic('max');
+          }
+        }, 120);
+      } catch (e) {
+        console.warn('[Mic] voice monitor unavailable:', e);
+      }
+    }
 
     async function startBrowserMic() {
       try {
-        mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: { ideal: true },
+            noiseSuppression: { ideal: true },
+            autoGainControl: { ideal: true },
+            channelCount: { ideal: 1 },
+          }
+        });
       } catch (e) {
         alert('마이크 접근이 거부되었습니다: ' + e.message);
         setUIState('idle');
@@ -5201,33 +5541,41 @@
         if (e.data && e.data.size > 0) recordedChunks.push(e.data);
       };
       mediaRecorder.onstop = () => {
+        stopDesktopVoiceMonitor();
         const type = (mediaRecorder && mediaRecorder.mimeType) || 'audio/webm';
         const blob = new Blob(recordedChunks, { type });
         if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        mediaRecorder = null;
         if (!blob.size) { setUIState('idle'); return; }
         const reader = new FileReader();
         reader.onload = () => {
           if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
+            const msg = {
               type: 'audio_upload',
               tab_id: ASSISTANT_TAB_ID,
               suffix: '.webm',
               data: reader.result,   // data URL (base64)
-            }));
+            };
+            const liveFrame = liveVisionOn ? captureFrameSync() : null;
+            if (liveFrame) msg.image = liveFrame;
+            ws.send(JSON.stringify(msg));
           }
         };
         reader.readAsDataURL(blob);
       };
-      mediaRecorder.start();
+      mediaRecorder.start(250);
       browserMicActive = true;
+      startDesktopVoiceMonitor(mediaStream);
       setUIState('recording');
     }
 
-    function stopBrowserMic() {
+    function stopBrowserMic(reason = 'manual') {
       browserMicActive = false;
       if (mediaRecorder && mediaRecorder.state !== 'inactive') {
         setUIState('processing');
         try { mediaRecorder.stop(); } catch (e) {}
+      } else {
+        stopDesktopVoiceMonitor();
       }
     }
 
@@ -5244,15 +5592,8 @@
 
       if (isMobileView) {
         // Mobile: use Web Speech API (phone mic)
-        if (!webSpeechRecognition) {
-          webSpeechRecognition = initWebSpeech();
-        }
-        if (!webSpeechRecognition) {
-          alert('이 브라우저에서 음성 인식이 지원되지 않습니다.');
-          return;
-        }
-        if (webSpeechActive) {
-          stopWebSpeech();
+        if (voiceCaptureActive()) {
+          stopVoiceCapture();
         } else {
           // Play "Yes, sir" before starting recognition (original speed)
           try {
@@ -5267,7 +5608,7 @@
                 src.start(0);
               }).catch(() => {});
           } catch(e) {}
-          try { webSpeechRecognition.start(); } catch(e) {}
+          startVoiceCapture();
         }
       } else {
         // Desktop (Linux port): capture browser mic → audio_upload → STT

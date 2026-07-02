@@ -22,6 +22,7 @@ preserved for backward compatibility.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import uuid
@@ -237,7 +238,10 @@ class SessionManager:
             session.messages = session.messages[-HISTORY_LIMIT:]
 
         provider = get_provider()
-        model = provider.resolve_model(session.model_alias)
+        if image and provider.name == "openai":
+            model = os.environ.get("VISION_MODEL", "").strip() or "gpt-5-mini"
+        else:
+            model = provider.resolve_model(session.model_alias)
         accumulated = ""
 
         try:
