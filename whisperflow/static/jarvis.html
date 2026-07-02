@@ -5212,31 +5212,44 @@
 
     function registerGesture() {
       if (!gestureRecognizer) { pipSay('제스처 모델이 아직 준비되지 않았습니다.'); return; }
+      // Registration mode: pause gesture ACTIONS (recognition keeps running)
+      // so demonstrating a hand doesn't fire analyze/record mid-flow.
+      gestureSuppressUntil = Date.now() + 30000;
       const seen = lastGestureSeen && Date.now() - lastGestureSeen.at < 3500
         ? lastGestureSeen.name
         : null;
-      if (!seen) { pipSay('등록할 손동작을 카메라에 보여주세요.'); return; }
+      if (!seen) {
+        pipSay('등록할 손동작을 카메라에 보여준 뒤 다시 [손]을 누르세요 (30초간 명령 실행 중지)');
+        return;
+      }
+      const cancel = () => { gestureSuppressUntil = Date.now() + 2000; };
       const label = prompt(`현재 인식된 제스처: ${seen}\n저장할 이름을 입력하세요:`);
-      if (!label) return;
+      if (!label) { cancel(); return; }
       const action = (prompt('동작을 입력하세요: record / stop / analyze / ask', 'analyze') || '').trim();
       if (!['record', 'stop', 'analyze', 'ask'].includes(action)) {
         pipSay('지원 동작: record, stop, analyze, ask');
-        return;
+        cancel(); return;
       }
       let phrase = '';
       if (action === 'ask') {
         phrase = prompt('이 제스처가 보낼 문장을 입력하세요:', '지금 보이는 걸 설명해줘') || '';
-        if (!phrase.trim()) return;
+        if (!phrase.trim()) { cancel(); return; }
       }
       const db = getGestureDB();
       db[seen] = { label, action, phrase, saved_at: Date.now() };
       saveGestureDB(db);
-      pipSay(`손동작 '${label}' 등록 완료 → ${action}`);
+      // Short grace period so the hand still on camera doesn't instantly
+      // fire the action it was just registered to.
+      gestureSuppressUntil = Date.now() + 4000;
+      pipSay(`손동작 '${label}' 등록 완료 → ${action} (4초 후 활성화)`);
     }
 
     function startGestureLoop() {
       if (gestureRAF) { cancelAnimationFrame(gestureRAF); gestureRAF = null; }
       let lastTs = 0;
+      // Hold-to-fire: an action triggers only after the SAME gesture is
+      // held ~0.6s, so a hand passing through frame can't fire '화면 분석'.
+      let holdName = null, holdSince = 0;
       const loop = () => {
         if (!liveVisionOn || !gestureRecognizer) return;
         const now = performance.now();
@@ -5253,7 +5266,15 @@
                   ? `손: ${custom.label} (${g.categoryName})`
                   : `손: ${g.categoryName}`;
               }
-              if (g.score > 0.6) handleGesture(g.categoryName);
+              if (g.score > 0.6) {
+                if (holdName !== g.categoryName) { holdName = g.categoryName; holdSince = now; }
+                else if (now - holdSince >= 600) handleGesture(g.categoryName);
+              } else {
+                holdName = null;
+              }
+            } else {
+              holdName = null;
+              if (pipGestureLabel) pipGestureLabel.textContent = '';
             }
           } catch (e) { /* single-frame failure: keep looping */ }
         }
@@ -5286,8 +5307,14 @@
       }
     }
 
+    // While the user is REGISTERING a gesture/face they must be able to
+    // show hands to the camera without triggering actions (showing ✌️ to
+    // register it kept firing '화면 분석').
+    let gestureSuppressUntil = 0;
+
     function handleGesture(name) {
       const now = Date.now();
+      if (now < gestureSuppressUntil) return;
       if (now - lastGestureAction < 2500) return; // cooldown
       const custom = getGestureDB()[name];
       if (custom) {
@@ -5360,8 +5387,9 @@
 
     async function registerFace() {
       if (!faceReady) { alert('얼굴인식 모델이 아직 준비되지 않았습니다.'); return; }
+      gestureSuppressUntil = Date.now() + 15000; // no gesture actions while posing
       const name = prompt('등록할 이름을 입력하세요:');
-      if (!name) return;
+      if (!name) { gestureSuppressUntil = Date.now() + 2000; return; }
       pipSay('얼굴 캡처 중… 카메라를 정면으로 봐주세요');
       const desc = await getDescriptor();
       if (!desc) { pipSay('얼굴을 찾지 못했습니다. 다시 시도하세요.'); return; }
