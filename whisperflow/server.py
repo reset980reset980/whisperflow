@@ -108,6 +108,7 @@ class WhisperFlowServer:
         threading.Thread(target=producer, daemon=True).start()
 
         spoke = False
+        t0 = time.monotonic()
         while True:
             audio = audio_q.get()
             if audio is None:
@@ -118,6 +119,7 @@ class WhisperFlowServer:
                 continue  # this sentence failed to synthesize; skip it
 
             if not spoke:
+                print(f"[TTS] first_audio elapsed={time.monotonic() - t0:.2f}s", flush=True)
                 self.ws.broadcast_state("tts_playing")
                 spoke = True
             b64 = base64.b64encode(audio).decode("ascii")
@@ -146,6 +148,7 @@ class WhisperFlowServer:
         if gen == self._tts_gen:
             if spoke:
                 self.ws.broadcast_raw(json.dumps({"type": "tts_done"}))
+                print(f"[TTS] done elapsed={time.monotonic() - t0:.2f}s", flush=True)
             self.ws.broadcast_state("idle")
 
     def _on_tts_interrupt(self):

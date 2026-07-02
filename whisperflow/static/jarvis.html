@@ -3006,12 +3006,9 @@
         // audio_level 스트림을 매 청크마다 덮어써서 파티클이 안 튄다.
         // 음성 종료(구름 복귀)는 서버의 state:idle 에서만 처리한다.
         // TTS 재생 완료 → 대기 중이던 음성 입력 시작
-        if (_pendingListenAfterTts && isMobileView && !webSpeechActive) {
+        if (_pendingListenAfterTts && !voiceCaptureActive()) {
           _pendingListenAfterTts = false;
-          if (!webSpeechRecognition) webSpeechRecognition = initWebSpeech();
-          if (webSpeechRecognition) {
-            try { webSpeechRecognition.start(); } catch(e) {}
-          }
+          startVoiceCapture({ requestCamera: false });
         }
         return;
       }
@@ -3812,8 +3809,8 @@
 
             if (newState === 'recording') {
               showListening();
-              // Mobile: TTS 재생 완료 후 Web Speech 시작
-              if (isMobileView && !voiceCaptureActive()) {
+              // TTS 재생 완료 후 음성 입력 시작
+              if (!voiceCaptureActive()) {
                 if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
                   _pendingListenAfterTts = true;
                 } else {
@@ -3833,10 +3830,11 @@
               stopActiveTyping();
               stopWaveformAnim();
               activeOutputMsg = null;
-              // Mobile: 서버가 idle 브로드캐스트하면 Web Speech 중지
-              if (isMobileView && webSpeechActive) {
+              // 서버가 idle 브로드캐스트하면 Web Speech 중지
+              if (webSpeechActive) {
                 stopWebSpeech();
               }
+              scheduleAutoListen(800);
             }
           }
           break;
@@ -4599,13 +4597,8 @@
             ws.send(JSON.stringify({ type: 'tts_interrupt' }));
           }
         }
-        if (isMobileView) {
-          if (voiceCaptureActive()) stopVoiceCapture();
-          else startVoiceCapture();
-        } else {
-          if (browserMicActive) stopBrowserMic();
-          else startBrowserMic();
-        }
+        if (voiceCaptureActive()) stopVoiceCapture();
+        else startVoiceCapture();
       });
     }
 
@@ -5011,9 +5004,10 @@
     let camStream = null, camVideo = null, camPip = null;
     let gestureRecognizer = null, gestureRAF = null, lastGestureAction = 0;
     let faceReady = false, faceTimer = null, lastGreeted = {};
-    let pipStatus = null, pipFaceLabel = null;
+    let pipStatus = null, pipFaceLabel = null, pipGestureLabel = null;
     let cameraFacingMode = isMobileView ? 'environment' : 'user';
     let cameraReady = false;
+    let lastGestureSeen = null;
 
     function captureFrameSync() {
       if (!camVideo || !camVideo.videoWidth || !camVideo.videoHeight) {
@@ -5066,18 +5060,20 @@
       camVideo = null;
       pipStatus = null;
       pipFaceLabel = null;
+      pipGestureLabel = null;
       cameraReady = false;
       chatCameraBtn.classList.remove('recording');
     }
 
     async function startLiveVision() {
+      if (liveVisionOn && camStream) return true;
       try {
         camStream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: cameraFacingMode }, width: { ideal: 960 } }
         });
       } catch (e) {
         alert('카메라 접근이 거부되었습니다: ' + e.message);
-        return;
+        return false;
       }
       liveVisionOn = true;
       chatCameraBtn.classList.add('recording');
@@ -5096,6 +5092,8 @@
 
       pipFaceLabel = document.createElement('div');
       pipFaceLabel.style.cssText = 'min-height:13px;color:#7dffb0;text-align:center;';
+      pipGestureLabel = document.createElement('div');
+      pipGestureLabel.style.cssText = 'min-height:13px;color:#ffd166;text-align:center;';
       pipStatus = document.createElement('div');
       pipStatus.style.cssText = 'min-height:13px;text-align:center;opacity:.85;';
       pipStatus.textContent = 'LIVE — 질문하면 현재 화면이 함께 전송됩니다';
@@ -5113,10 +5111,11 @@
       row.append(
         mkBtn('📸', '지금 화면 분석', () => analyzeNow()),
         mkBtn('↺', '전면/후면 카메라 전환', () => switchLiveCamera()),
-        mkBtn('😀등록', '얼굴 등록', () => registerFace()),
+        mkBtn('얼굴', '얼굴 등록', () => registerFace()),
+        mkBtn('손', '제스처 등록', () => registerGesture()),
         mkBtn('✕', '카메라 끄기', () => stopLiveVision()),
       );
-      camPip.append(camVideo, pipFaceLabel, pipStatus, row);
+      camPip.append(camVideo, pipFaceLabel, pipGestureLabel, pipStatus, row);
       document.body.appendChild(camPip);
 
       camVideo.play().catch(() => {});
@@ -5126,6 +5125,7 @@
       });
       initGestures();   // fire-and-forget; sets status on failure
       initFaces();
+      return true;
     }
 
     async function switchLiveCamera() {
@@ -5152,6 +5152,58 @@
     });
 
     // ---- Gestures (MediaPipe GestureRecognizer, built-in gesture set) ----
+    function getGestureDB() {
+      try { return JSON.parse(localStorage.getItem('jarvis_gestures') || '{}'); }
+      catch (e) { return {}; }
+    }
+
+    function saveGestureDB(db) {
+      localStorage.setItem('jarvis_gestures', JSON.stringify(db));
+    }
+
+    function runGestureAction(action, phrase) {
+      if (action === 'record') {
+        if (!voiceCaptureActive() && !isStreaming) startVoiceCapture();
+      } else if (action === 'stop') {
+        if (voiceCaptureActive()) stopVoiceCapture();
+        else if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
+          stopTtsPlayback();
+          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'tts_interrupt' }));
+        }
+      } else if (action === 'analyze') {
+        if (!isStreaming) analyzeNow();
+      } else if (action === 'ask' && phrase) {
+        if (!isStreaming && ws && ws.readyState === WebSocket.OPEN) {
+          chatSlideInput.value = phrase;
+          sendChatMessage();
+        }
+      }
+    }
+
+    function registerGesture() {
+      if (!gestureRecognizer) { pipSay('제스처 모델이 아직 준비되지 않았습니다.'); return; }
+      const seen = lastGestureSeen && Date.now() - lastGestureSeen.at < 3500
+        ? lastGestureSeen.name
+        : null;
+      if (!seen) { pipSay('등록할 손동작을 카메라에 보여주세요.'); return; }
+      const label = prompt(`현재 인식된 제스처: ${seen}\n저장할 이름을 입력하세요:`);
+      if (!label) return;
+      const action = (prompt('동작을 입력하세요: record / stop / analyze / ask', 'analyze') || '').trim();
+      if (!['record', 'stop', 'analyze', 'ask'].includes(action)) {
+        pipSay('지원 동작: record, stop, analyze, ask');
+        return;
+      }
+      let phrase = '';
+      if (action === 'ask') {
+        phrase = prompt('이 제스처가 보낼 문장을 입력하세요:', '지금 보이는 걸 설명해줘') || '';
+        if (!phrase.trim()) return;
+      }
+      const db = getGestureDB();
+      db[seen] = { label, action, phrase, saved_at: Date.now() };
+      saveGestureDB(db);
+      pipSay(`손동작 '${label}' 등록 완료 → ${action}`);
+    }
+
     function startGestureLoop() {
       if (gestureRAF) { cancelAnimationFrame(gestureRAF); gestureRAF = null; }
       let lastTs = 0;
@@ -5163,7 +5215,16 @@
           try {
             const res = gestureRecognizer.recognizeForVideo(camVideo, now);
             const g = res.gestures && res.gestures[0] && res.gestures[0][0];
-            if (g && g.score > 0.6) handleGesture(g.categoryName);
+            if (g && g.score > 0.45) {
+              lastGestureSeen = { name: g.categoryName, score: g.score, at: Date.now() };
+              if (pipGestureLabel) {
+                const custom = getGestureDB()[g.categoryName];
+                pipGestureLabel.textContent = custom
+                  ? `손: ${custom.label} (${g.categoryName})`
+                  : `손: ${g.categoryName}`;
+              }
+              if (g.score > 0.6) handleGesture(g.categoryName);
+            }
           } catch (e) { /* single-frame failure: keep looping */ }
         }
         gestureRAF = requestAnimationFrame(loop);
@@ -5198,6 +5259,13 @@
     function handleGesture(name) {
       const now = Date.now();
       if (now - lastGestureAction < 2500) return; // cooldown
+      const custom = getGestureDB()[name];
+      if (custom) {
+        lastGestureAction = now;
+        pipSay(`손동작: ${custom.label}`);
+        runGestureAction(custom.action, custom.phrase);
+        return;
+      }
       if (name === 'Open_Palm' && !voiceCaptureActive() && !isStreaming) {
         lastGestureAction = now;
         pipSay('✋ 녹음 시작');
@@ -5334,7 +5402,27 @@
     let accumulatedText = '';       // continuous 모드에서 누적 텍스트
     let finalTranscriptParts = [];  // Web Speech resultIndex별 final 텍스트
     let webSpeechTurnSent = false;
+    let autoListenEnabled = localStorage.getItem('jarvis_auto_listen') !== 'false';
+    let autoListenTimer = null;
+    let autoListenSuppressUntil = 0;
     const SILENCE_TIMEOUT = 3000;   // 3초 무음 시 자동 종료
+
+    function suppressAutoListen(ms = 4000) {
+      autoListenSuppressUntil = Date.now() + ms;
+      if (autoListenTimer) { clearTimeout(autoListenTimer); autoListenTimer = null; }
+    }
+
+    function scheduleAutoListen(delay = 700) {
+      if (!autoListenEnabled) return;
+      if (autoListenTimer) clearTimeout(autoListenTimer);
+      autoListenTimer = setTimeout(() => {
+        autoListenTimer = null;
+        if (!autoListenEnabled) return;
+        if (Date.now() < autoListenSuppressUntil) return;
+        if (isStreaming || ttsAudioPlaying || ttsAudioQueue.length > 0 || voiceCaptureActive()) return;
+        startVoiceCapture({ requestCamera: false });
+      }, delay);
+    }
 
     function clearSilenceTimer() {
       if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
@@ -5380,6 +5468,24 @@
         startSilenceTimer();
       };
 
+      // Merge Web Speech final segments. Handles both engines:
+      //  - desktop style: each final is a NEW segment  → append
+      //  - Android style: each final repeats the FULL utterance → replace
+      function mergeSpeechFinals(parts) {
+        const compact = (s) => s.replace(/\s+/g, '');
+        let out = '';
+        for (const raw of parts) {
+          if (!raw) continue;
+          const p = raw.trim();
+          if (!p) continue;
+          if (!out) { out = p; continue; }
+          if (compact(p).startsWith(compact(out))) { out = p; continue; } // cumulative
+          if (compact(out).endsWith(compact(p))) continue;                // duplicate tail
+          out += ' ' + p;
+        }
+        return out;
+      }
+
       recognition.onresult = (event) => {
         let interim = '';
         const start = event.resultIndex || 0;
@@ -5391,7 +5497,10 @@
             interim += transcript;
           }
         }
-        accumulatedText = finalTranscriptParts.filter(Boolean).join('');
+        // Android Chrome repeats the WHOLE utterance in each final result
+        // (server logs showed '자비스자비스자비스 지금…'), so merge finals by
+        // collapsing cumulative/duplicated segments instead of joining.
+        accumulatedText = mergeSpeechFinals(finalTranscriptParts);
         // Show combined text in input field
         chatSlideInput.value = accumulatedText + (interim ? interim : '');
         // Scroll down to show latest wrapped line
@@ -5449,11 +5558,22 @@
     }
 
     function voiceCaptureActive() {
-      return isMobileView ? (webSpeechActive || webSpeechStarting) : browserMicActive;
+      return webSpeechActive || webSpeechStarting || browserMicActive;
     }
 
-    function startVoiceCapture() {
-      if (isMobileView) {
+    function browserSpeechAvailable() {
+      return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+    }
+
+    async function startVoiceCapture(options = {}) {
+      const requestCamera = options.requestCamera !== false;
+      // Same user gesture as the mic button: request camera too, so browsers
+      // show the camera permission prompt and live vision is ready for "보여?".
+      if (requestCamera && !liveVisionOn && !camStream) {
+        await startLiveVision();
+      }
+
+      if (browserSpeechAvailable()) {
         if (!webSpeechRecognition) webSpeechRecognition = initWebSpeech();
         if (!webSpeechRecognition) {
           alert('이 브라우저에서 음성 인식이 지원되지 않습니다.');
@@ -5468,10 +5588,12 @@
       }
     }
 
-    function stopVoiceCapture() {
-      if (isMobileView) {
-        if (webSpeechActive) stopWebSpeech();
-      } else if (browserMicActive) {
+    function stopVoiceCapture(manual = true) {
+      if (manual) suppressAutoListen();
+      if (webSpeechActive || webSpeechStarting) {
+        stopWebSpeech();
+      }
+      if (browserMicActive) {
         stopBrowserMic();
       }
     }
@@ -5503,9 +5625,9 @@
     let desktopMicLastVoiceAt = 0;
     let desktopMicHeardSpeech = false;
     let desktopMicNoiseFloor = 0.012;
-    const DESKTOP_SILENCE_TIMEOUT = 1600;
+    const DESKTOP_SILENCE_TIMEOUT = 1000;
     const DESKTOP_MIN_RECORD_MS = 900;
-    const DESKTOP_MAX_RECORD_MS = 15000;
+    const DESKTOP_MAX_RECORD_MS = 8000;
 
     function stopDesktopVoiceMonitor() {
       if (desktopMicMonitorTimer) {
@@ -5552,7 +5674,7 @@
             return;
           }
 
-          const voiceThreshold = Math.max(0.014, desktopMicNoiseFloor * 2.5);
+          const voiceThreshold = Math.max(0.008, desktopMicNoiseFloor * 1.8);
           if (rms > voiceThreshold) {
             desktopMicHeardSpeech = true;
             desktopMicLastVoiceAt = now;
@@ -5661,8 +5783,8 @@
         }
       }
 
-      if (isMobileView) {
-        // Mobile: use Web Speech API (phone mic)
+      if (browserSpeechAvailable()) {
+        // Browser STT is much faster than uploading audio to local Whisper.
         if (voiceCaptureActive()) {
           stopVoiceCapture();
         } else {
@@ -5682,11 +5804,11 @@
           startVoiceCapture();
         }
       } else {
-        // Desktop (Linux port): capture browser mic → audio_upload → STT
+        // Fallback: capture browser mic → audio_upload → server STT
         if (browserMicActive) {
-          stopBrowserMic();
+          stopVoiceCapture();
         } else {
-          startBrowserMic();
+          startVoiceCapture();
         }
       }
     });

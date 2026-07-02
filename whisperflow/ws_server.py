@@ -382,6 +382,12 @@ class WhisperFlowWSServer:
             }))
             return
 
+        t0 = _time.monotonic()
+        print(
+            f"[Audio] upload tab={tab_id} bytes={len(audio)} "
+            f"suffix={suffix} image={'yes' if image else 'no'}",
+            flush=True,
+        )
         await self._broadcast(json.dumps({"type": "state", "value": "processing"}))
 
         loop = self._loop
@@ -393,6 +399,11 @@ class WhisperFlowWSServer:
             logger.error("STT error: %s", e)
             text = ""
         text = (text or "").strip()
+        print(
+            f"[Audio] stt_done tab={tab_id} elapsed={_time.monotonic() - t0:.2f}s "
+            f"text={text[:80]!r}",
+            flush=True,
+        )
 
         if not text:
             await self._broadcast(json.dumps({"type": "state", "value": "idle"}))
@@ -471,6 +482,8 @@ class WhisperFlowWSServer:
         def stream_worker():
             # Reset streaming buffer for this tab
             self._streaming_buffers[tab_id] = ""
+            t0 = _time.monotonic()
+            first_chunk_logged = False
             try:
                 for chunk in session_manager.send_stream(tab_id, text, image=image):
                     chunk_type = chunk.get("type", "")
@@ -500,6 +513,14 @@ class WhisperFlowWSServer:
                     if not content:
                         continue
 
+                    if not first_chunk_logged:
+                        first_chunk_logged = True
+                        print(
+                            f"[Chat] first_chunk tab={tab_id} "
+                            f"elapsed={_time.monotonic() - t0:.2f}s",
+                            flush=True,
+                        )
+
                     msg = json.dumps({
                         "type": "chat_chunk",
                         "tab_id": tab_id,
@@ -516,6 +537,11 @@ class WhisperFlowWSServer:
             finally:
                 # Save accumulated assistant response to file
                 accumulated = self._streaming_buffers.pop(tab_id, "")
+                print(
+                    f"[Chat] done tab={tab_id} elapsed={_time.monotonic() - t0:.2f}s "
+                    f"chars={len(accumulated)}",
+                    flush=True,
+                )
                 if accumulated:
                     self._save_chat_message(tab_id, "assistant", accumulated)
                     # TTS: 응답 텍스트를 음성으로 읽기
