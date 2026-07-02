@@ -242,6 +242,12 @@ class SessionManager:
             model = os.environ.get("VISION_MODEL", "").strip() or "gpt-5-mini"
         else:
             model = provider.resolve_model(session.model_alias)
+        if image:
+            print(
+                f"[Vision] provider={provider.name} model={model} "
+                f"image_bytes={len(image)}",
+                flush=True,
+            )
         accumulated = ""
 
         try:

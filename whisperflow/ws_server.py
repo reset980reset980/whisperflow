@@ -25,6 +25,30 @@ from whisperflow.assistant_session import session_manager
 
 logger = logging.getLogger(__name__)
 
+
+def _looks_like_vision_request(text: str) -> bool:
+    compact = "".join((text or "").split())
+    return any(
+        key in compact
+        for key in (
+            "내가보",
+            "나보",
+            "보이",
+            "카메라",
+            "화면",
+            "사진",
+            "이미지",
+            "스크린샷",
+            "이거",
+            "저거",
+            "이문서",
+            "지금이거",
+            "앞에",
+            "얼굴",
+        )
+    )
+
+
 # Host/port are configurable via env for the Linux port (Caddy proxies to
 # these). Defaults preserve the original macOS behaviour (localhost:8767).
 WS_HOST = os.environ.get("WHISPERFLOW_HOST", "127.0.0.1")
@@ -358,6 +382,7 @@ class WhisperFlowWSServer:
         suffix = data.get("suffix", ".webm")
         b64 = data.get("data", "")
         image = data.get("image")
+        expect_image = bool(data.get("expect_image"))
         if "," in b64:
             b64 = b64.split(",", 1)[1]
 
@@ -402,7 +427,13 @@ class WhisperFlowWSServer:
         # Show the recognized text in the UI, then feed it to the AI.
         await self._broadcast(json.dumps({"type": "transcript", "value": text}))
         await self._handle_chat_input(
-            websocket, {"tab_id": tab_id, "text": text, "image": image}
+            websocket,
+            {
+                "tab_id": tab_id,
+                "text": text,
+                "image": image,
+                "expect_image": expect_image,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -414,11 +445,31 @@ class WhisperFlowWSServer:
         tab_id = data.get("tab_id", "")
         text = data.get("text", "")
         image = data.get("image")  # optional data URL for vision
+        expect_image = bool(data.get("expect_image"))
 
         if not tab_id or not text:
             await websocket.send(json.dumps({
                 "type": "chat_error", "tab_id": tab_id,
                 "error": "tab_id and text are required",
+            }))
+            return
+
+        image_len = len(image) if isinstance(image, str) else 0
+        print(
+            "[Vision] chat_input "
+            f"tab={tab_id} image={'yes' if image else 'no'} "
+            f"bytes={image_len} expect={expect_image} text={text[:80]!r}",
+            flush=True,
+        )
+
+        if not image and (expect_image or _looks_like_vision_request(text)):
+            await websocket.send(json.dumps({
+                "type": "chat_error",
+                "tab_id": tab_id,
+                "error": (
+                    "카메라 프레임이 첨부되지 않았습니다. "
+                    "📷 LIVE 프리뷰가 움직이는지 확인한 뒤 다시 물어봐 주세요."
+                ),
             }))
             return
 
@@ -430,7 +481,9 @@ class WhisperFlowWSServer:
             )
 
         # Save user message to file
-        self._save_chat_message(tab_id, "user", text)
+        self._save_chat_message(
+            tab_id, "user", f"{text} [사진 첨부됨]" if image else text
+        )
 
         loop = self._loop
 
