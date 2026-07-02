@@ -22,12 +22,12 @@
 ## 2. 아키텍처
 
 ```
-브라우저 (jarvis.html — 파티클 UI + 카메라/마이크 캡처, 전 기기 공통)
+브라우저 (jarvis.html — 파티클 UI + 카메라/마이크/비전/제스처/얼굴, 전 기기 공통)
    │ wss:// (Caddy가 프록시)
    ▼
 whisperflow.server (WhisperFlowServer)          ← 헤드리스 진입점
    ├─ ws_server.py   : HTTP 정적 + WS 허브 (포트 8767 공유)
-   ├─ stt.py         : faster-whisper (로컬 CPU int8, 브라우저 webm 디코드)
+   ├─ stt.py         : faster-whisper (Web Speech 미지원 브라우저의 audio_upload 폴백)
    ├─ assistant_session.py : 멀티세션 + 인메모리 대화 히스토리(20턴 캡)
    ├─ ai_backend.py  : OpenAI 스트리밍 + function calling 루프 (stdlib urllib SSE)
    ├─ tools.py       : 실시간 도구 8종 (아래 §4)
@@ -44,13 +44,13 @@ macOS 원본 모듈(app.py, hotkey_manager, gesture_control, hue_controller 등)
 | 방향 | type | 필드 | 설명 |
 |------|------|------|------|
 | C→S | `chat_input` | `tab_id, text, image?, expect_image?` | 텍스트 질문. `image`=data URL(비전). `expect_image`=라이브 모드에서 프레임이 있어야 함을 명시(클라가 프레임 첨부 실패 시 서버가 정중히 거절) |
-| C→S | `audio_upload` | `tab_id, suffix, data, image?` | 브라우저 마이크 녹음(webm base64) → STT → chat 흐름. 라이브 모드면 현재 프레임 동봉 |
+| C→S | `audio_upload` | `tab_id, suffix, data, image?` | Web Speech 미지원 브라우저 폴백. 브라우저 마이크 녹음(webm base64) → STT → chat 흐름. 라이브 모드면 현재 프레임 동봉 |
 | S→C | `transcript` | `value` | STT 결과 |
 | S→C | `chat_chunk` / `chat_done` / `chat_error` | | 스트리밍 응답 (chunk는 **누적이 아닌 diff**, ws_server가 누적버퍼에서 diff 계산) |
 | S→C | `tts_audio` | `value`(base64 wav) | 문장 단위 청크. UI가 큐(ttsAudioQueue)로 연속 재생 |
 | S→C | `audio_level` | `value, low, mid, high` | TTS 재생과 동기화된 30fps 엔벨로프 → 파티클 진동 |
 | S→C | `state` | `value` | idle/processing/thinking/recording/tts_playing |
-| C→S | `tts_interrupt` | | 재생 중단 → 서버 gen 카운터 증가로 엔벨로프 스트림 취소 |
+| C→S | `tts_interrupt` | `reason?` | 재생 중단 → 서버 gen 카운터 증가로 엔벨로프 스트림 취소. `reason=manual/gesture/barge_in` 로깅 |
 
 **중요 규칙**: 서버는 `expect_image=True && image 없음`일 때만 비전 요청을 거절한다.
 **키워드 추측으로 차단하지 말 것** — "이거/화면/보이" 등은 일상어라 일반 채팅이 막힌다
@@ -80,13 +80,29 @@ macOS 원본 모듈(app.py, hotkey_manager, gesture_control, hue_controller 등)
 
 ## 5. 비전 / 라이브 / 제스처 / 얼굴 (프론트, jarvis.html)
 
+- **음성 입력 기본 경로**: PC/모바일 모두 브라우저 Web Speech API를 우선 사용한다
+  (`SpeechRecognition`/`webkitSpeechRecognition`). Android Chrome의 final transcript 중복은
+  `mergeSpeechFinals`에서 누적/중복 세그먼트를 병합한다. Web Speech가 없을 때만
+  `MediaRecorder` → `audio_upload` → faster-whisper 서버 STT로 폴백한다.
+- **자동 재청취**: 최초 사용자 제스처와 마이크 권한 허용 후, 응답/TTS가 끝나면
+  `scheduleAutoListen`이 다시 듣기를 시작한다. `localStorage['jarvis_auto_listen']='false'`
+  로 끌 수 있다. 브라우저 정책상 최초 마이크/카메라 권한은 사용자 클릭 없이 열 수 없다.
+- **TTS barge-in**: 자비스가 말하는 동안 별도 마이크 VAD 감시를 켠다. 사용자 음성이
+  임계값을 넘으면 즉시 `tts_interrupt(reason='barge_in')`을 보내고 TTS 큐/엔벨로프를
+  끊은 뒤 녹음 상태로 전환한다. `localStorage['jarvis_barge_in']='false'` 로 비활성화.
 - **단일 촬영·첨부**: 이미지 → `shrinkImage`(≤1280px JPEG 0.85) → `chat_input.image`.
   `assistant_session`이 멀티모달 content로 1턴 전송 후 히스토리에서
   `"[사진 첨부됨]"` 마커로 치환(에러 경로 포함, `_strip_image`) — base64 재전송 방지.
+- **비전 모델**: 이미지/카메라가 포함된 턴은 `VISION_MODEL` 환경변수를 사용한다.
+  기본값은 `gpt-5-mini`이며, 일반 채팅 모델(`OPENAI_MODEL`/UI model alias)과 분리된다.
 - **라이브 모드**(📷 버튼): PiP 프리뷰 상시 표시. 켜져 있는 동안 모든 질문(음성 포함)에
   현재 프레임 자동 첨부. `captureLiveFrameForTurn`이 프레임 준비를 최대 1.8s 대기.
 - **제스처**: MediaPipe tasks-vision(CDN, 브라우저 실행) — ✋Open_Palm=녹음 시작,
   ✊Closed_Fist=녹음종료/TTS중단, ✌️Victory=화면 분석. 쿨다운 2.5s, ~5fps.
+- **제스처 등록**: PiP의 `손` 버튼으로 현재 인식된 MediaPipe 내장 카테고리를
+  사용자 라벨과 동작(`record`, `stop`, `analyze`, `ask`)에 매핑한다.
+  저장소는 `localStorage['jarvis_gestures']`. 임의 손동작을 새 ML 클래스로 학습하는
+  기능은 아니며, 브라우저 모델이 이미 인식하는 카테고리를 액션에 등록하는 방식이다.
 - **얼굴 등록/인식**: @vladmandic/face-api(CDN) tiny 모델 3종. 등록 시 128-d
   디스크립터를 `localStorage['jarvis_faces']`에 저장(이름당 최대 5샘플).
   유클리드 거리 <0.5 매칭, 인식 시 10분당 1회 자비스가 이름 불러 인사.
@@ -97,11 +113,13 @@ macOS 원본 모듈(app.py, hotkey_manager, gesture_control, hue_controller 등)
 
 | 구간 | 값 | 관련 설정 |
 |------|-----|----------|
-| STT (base, warm) | ~2.4s | `WHISPER_BEAM_SIZE=1` (5로 올리면 +1s, 정확도 미차) |
-| STT 첫 요청 | 페널티 없음 | 서버 시작 시 `stt.preload()` 백그라운드 로드 |
+| STT 기본 경로 | 브라우저 Web Speech | PC/모바일 공통. 서버 STT보다 응답 시작이 빠름 |
+| STT 폴백(base, warm) | ~2.4s | Web Speech 미지원 시 `audio_upload`; `WHISPER_BEAM_SIZE=1` |
+| STT 폴백 첫 요청 | 페널티 없음 | 서버 시작 시 `stt.preload()` 백그라운드 로드 |
 | AI 응답(도구 없음) | 첫 토큰 ~1s, 완료 ~3s | gpt-4o-mini |
 | AI 응답(도구 1개) | +2~4s | 왕복 1회 추가 |
 | 첫 TTS 오디오 | 텍스트 ~3.5s / 음성 ~5.8s | **문장 파이프라인** — `_split_sentences`로 쪼개 첫 문장 합성 즉시 전송, 이후 문장은 재생 중 백그라운드 합성 |
+| TTS 끼어들기 | ~0.2s 이상 발화 감지 | 브라우저 VAD, `tts_interrupt(reason='barge_in')` |
 
 ## 7. 함정 / 하지 말 것
 
@@ -130,7 +148,7 @@ macOS 원본 모듈(app.py, hotkey_manager, gesture_control, hue_controller 등)
 
 ## 9. 남은 일 / 아이디어
 
-- [ ] 제스처·얼굴인식 실기기 검증 (코드 배포됨, 브라우저 테스트 미완)
+- [ ] 제스처·얼굴인식 UX 튜닝 (인식 자체는 웹 PiP에 배포됨)
 - [ ] 웨이크워드("자비스") — 브라우저 상시 청취 + 로컬 키워드 감지
 - [ ] TTS 보이스/속도 설정 UI (`OPENAI_TTS_VOICE` 노출)
 - [ ] 얼굴 DB 서버 저장 (현재 localStorage — 기기별 분리됨)

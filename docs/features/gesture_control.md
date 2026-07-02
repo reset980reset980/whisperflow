@@ -1,5 +1,22 @@
 # 제스처 컨트롤 현황
 
+> 2026-07-02 기준: 이 문서는 원본 macOS/서버 카메라 기반
+> `whisperflow/gesture_control.py` 구현 설명이다. Linux 웹 포트의 실제 제스처/얼굴
+> 기능은 `whisperflow/static/jarvis.html`에서 브라우저 MediaPipe Tasks Vision과
+> face-api로 실행된다. 웹 포트 현황은 [DEVELOPMENT-LINUX.md](../DEVELOPMENT-LINUX.md)
+> §5를 우선 참고할 것.
+
+## Linux 웹 포트 현황
+
+- 카메라 PiP가 켜져 있을 때 브라우저에서 MediaPipe GestureRecognizer를 실행한다.
+- 기본 제스처: `Open_Palm`=녹음 시작, `Closed_Fist`=녹음 종료/TTS 중단,
+  `Victory`=현재 화면 분석.
+- PiP의 `손` 버튼은 현재 인식된 MediaPipe 카테고리를 사용자 라벨과 동작
+  (`record`, `stop`, `analyze`, `ask`)에 매핑한다. 저장소는
+  `localStorage['jarvis_gestures']`.
+- 임의 손동작을 새 모델 클래스로 학습하는 기능은 아직 없다. 등록은 기존 모델이
+  인식하는 카테고리와 액션의 매핑이다.
+
 ## 실행 방법
 
 ```bash
