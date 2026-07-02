@@ -5069,12 +5069,41 @@
 
     async function startLiveVision() {
       if (liveVisionOn && camStream) return true;
+      // Diagnose BEFORE requesting: a remembered "block" or a machine with
+      // no webcam never shows the permission prompt, which reads as
+      // "버튼이 안 먹는다". Tell the user exactly which case they hit.
+      try {
+        if (navigator.permissions && navigator.permissions.query) {
+          const st = await navigator.permissions.query({ name: 'camera' });
+          if (st.state === 'denied') {
+            addChatMessage('error',
+              '카메라 권한이 브라우저에 "차단"으로 저장되어 있어 허용 팝업이 뜨지 않습니다. '
+              + '주소창의 자물쇠(🔒) → 사이트 설정 → 카메라를 "허용"으로 바꾼 뒤 새로고침해 주세요.');
+            return false;
+          }
+        }
+      } catch (e) { /* Firefox has no 'camera' permission name — proceed */ }
+      try {
+        const devs = await navigator.mediaDevices.enumerateDevices();
+        if (devs.length && !devs.some(d => d.kind === 'videoinput')) {
+          addChatMessage('error',
+            '이 기기에서 카메라 장치를 찾지 못했습니다. 웹캠이 연결되어 있는지 확인해 주세요. '
+            + '(마이크만 있는 PC에서는 카메라 허용 팝업이 뜨지 않습니다)');
+          return false;
+        }
+      } catch (e) { /* enumeration failure: let getUserMedia report */ }
       try {
         camStream = await navigator.mediaDevices.getUserMedia({
           video: { facingMode: { ideal: cameraFacingMode }, width: { ideal: 960 } }
         });
       } catch (e) {
-        alert('카메라 접근이 거부되었습니다: ' + e.message);
+        const why = {
+          NotAllowedError: '권한이 거부되었습니다. 주소창 자물쇠(🔒)에서 카메라를 허용해 주세요.',
+          NotFoundError: '카메라 장치를 찾을 수 없습니다.',
+          NotReadableError: '다른 프로그램이 카메라를 사용 중입니다. 해당 앱을 닫고 다시 시도하세요.',
+          OverconstrainedError: '요청한 해상도를 지원하지 않는 카메라입니다.',
+        }[e.name] || (e.name + ': ' + e.message);
+        addChatMessage('error', '카메라 시작 실패 — ' + why);
         return false;
       }
       liveVisionOn = true;
@@ -5402,7 +5431,22 @@
     let accumulatedText = '';       // continuous 모드에서 누적 텍스트
     let finalTranscriptParts = [];  // Web Speech resultIndex별 final 텍스트
     let webSpeechTurnSent = false;
-    let autoListenEnabled = localStorage.getItem('jarvis_auto_listen') !== 'false';
+    // Autonomous behaviours are OPT-IN. Default-on continuous listening
+    // made the assistant unpredictable (and on speakers, barge-in hears
+    // Jarvis's own TTS). Enable via URL (?auto=1) or the flag below.
+    const _urlFlags = new URLSearchParams(location.search);
+    function _optIn(storageKey, urlKey) {
+      if (_urlFlags.get(urlKey) === '1') {
+        localStorage.setItem(storageKey, 'true');
+        return true;
+      }
+      if (_urlFlags.get(urlKey) === '0') {
+        localStorage.setItem(storageKey, 'false');
+        return false;
+      }
+      return localStorage.getItem(storageKey) === 'true';
+    }
+    let autoListenEnabled = _optIn('jarvis_auto_listen', 'auto');
     let autoListenTimer = null;
     let autoListenSuppressUntil = 0;
     const SILENCE_TIMEOUT = 3000;   // 3초 무음 시 자동 종료
@@ -5630,7 +5674,9 @@
     let bargeInLastInterruptAt = 0;
     let bargeInSuppressUntil = 0;
     let bargeInUnavailableLogged = false;
-    const BARGE_IN_ENABLED = localStorage.getItem('jarvis_barge_in') !== 'false';
+    // Opt-in (?barge=1): on open speakers the VAD can hear Jarvis's own
+    // TTS and interrupt itself, so this must never default on.
+    const BARGE_IN_ENABLED = _optIn('jarvis_barge_in', 'barge');
 
     function ttsActiveForBargeIn() {
       return currentState === 'tts_playing' || ttsAudioPlaying || ttsAudioQueue.length > 0;
