@@ -270,7 +270,7 @@ class WhisperFlowWSServer:
                                 print("[WS] conversation_continue 콜백 미등록")
                         # tts_interrupt: TTS 재생 중단 → recording 상태로 전환 (브로드캐스트 안 함)
                         if msg_type == "tts_interrupt":
-                            print("[WS] tts_interrupt 수신")
+                            print(f"[WS] tts_interrupt 수신 reason={data.get('reason', 'unknown')}")
                             if self._on_tts_interrupt:
                                 try:
                                     self._on_tts_interrupt()

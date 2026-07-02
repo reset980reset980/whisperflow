@@ -3001,6 +3001,7 @@
     function playNextTtsChunk() {
       if (ttsAudioQueue.length === 0) {
         ttsAudioPlaying = false;
+        stopBargeInMonitor();
         // 주의: 여기서 targetAudio* 를 0으로 리셋하면 안 됨.
         // 데스크톱은 브라우저 자체 재생이 막혀 큐가 즉시 비므로, 서버가 보내는
         // audio_level 스트림을 매 청크마다 덮어써서 파티클이 안 튄다.
@@ -3013,6 +3014,7 @@
         return;
       }
       ttsAudioPlaying = true;
+      startBargeInMonitor();
       const arrayBuf = ttsAudioQueue.shift();
       const blob = new Blob([arrayBuf], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
@@ -3821,7 +3823,10 @@
               if (listeningWaveform && activeWaveformCanvas === listeningWaveform) {
                 stopWaveformAnim();
               }
+            } else if (newState === 'tts_playing') {
+              startBargeInMonitor();
             } else if (newState === 'idle') {
+              stopBargeInMonitor();
               // 음성 종료 → 구름 복귀 (TTS 음량 구동값의 유일한 권위적 리셋 지점)
               targetAudioLevel = 0;
               targetAudioLow = 0;
@@ -4591,11 +4596,8 @@
       micButton.addEventListener('click', () => {
         unlockTtsAudio();
         // Interrupt any ongoing TTS playback first.
-        if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
-          stopTtsPlayback();
-          if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'tts_interrupt' }));
-          }
+        if (ttsActiveForBargeIn()) {
+          sendTtsInterrupt('manual');
         }
         if (voiceCaptureActive()) stopVoiceCapture();
         else startVoiceCapture();
@@ -5166,9 +5168,8 @@
         if (!voiceCaptureActive() && !isStreaming) startVoiceCapture();
       } else if (action === 'stop') {
         if (voiceCaptureActive()) stopVoiceCapture();
-        else if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
-          stopTtsPlayback();
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'tts_interrupt' }));
+        else if (ttsActiveForBargeIn()) {
+          sendTtsInterrupt('gesture');
         }
       } else if (action === 'analyze') {
         if (!isStreaming) analyzeNow();
@@ -5273,10 +5274,9 @@
       } else if (name === 'Closed_Fist') {
         if (voiceCaptureActive()) {
           lastGestureAction = now; pipSay('✊ 녹음 종료 → 전송'); stopVoiceCapture();
-        } else if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
+        } else if (ttsActiveForBargeIn()) {
           lastGestureAction = now; pipSay('✊ 음성 중단');
-          stopTtsPlayback();
-          if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'tts_interrupt' }));
+          sendTtsInterrupt('gesture');
         }
       } else if (name === 'Victory' && !isStreaming) {
         lastGestureAction = now;
@@ -5419,7 +5419,7 @@
         autoListenTimer = null;
         if (!autoListenEnabled) return;
         if (Date.now() < autoListenSuppressUntil) return;
-        if (isStreaming || ttsAudioPlaying || ttsAudioQueue.length > 0 || voiceCaptureActive()) return;
+        if (isStreaming || ttsActiveForBargeIn() || voiceCaptureActive()) return;
         startVoiceCapture({ requestCamera: false });
       }, delay);
     }
@@ -5600,6 +5600,7 @@
 
     function stopTtsPlayback() {
       _pendingListenAfterTts = false;
+      stopBargeInMonitor();
       if (!ttsAudioPlaying && ttsAudioQueue.length === 0) return;
       const el = getTtsAudioEl();
       el.pause();
@@ -5607,6 +5608,179 @@
       el.onerror = null;
       ttsAudioQueue = [];
       ttsAudioPlaying = false;
+    }
+
+    function sendTtsInterrupt(reason = 'manual') {
+      bargeInSuppressUntil = Date.now() + 1500;
+      stopTtsPlayback();
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'tts_interrupt', reason }));
+      }
+    }
+
+    let bargeInStream = null;
+    let bargeInAudioCtx = null;
+    let bargeInAnalyser = null;
+    let bargeInData = null;
+    let bargeInTimer = null;
+    let bargeInStarting = false;
+    let bargeInStartedAt = 0;
+    let bargeInNoiseFloor = 0.012;
+    let bargeInCandidateSince = 0;
+    let bargeInLastInterruptAt = 0;
+    let bargeInSuppressUntil = 0;
+    let bargeInUnavailableLogged = false;
+    const BARGE_IN_ENABLED = localStorage.getItem('jarvis_barge_in') !== 'false';
+
+    function ttsActiveForBargeIn() {
+      return currentState === 'tts_playing' || ttsAudioPlaying || ttsAudioQueue.length > 0;
+    }
+
+    async function hasGrantedMicrophonePermission() {
+      if (!navigator.permissions || !navigator.permissions.query) return true;
+      try {
+        const status = await navigator.permissions.query({ name: 'microphone' });
+        return status.state === 'granted';
+      } catch (e) {
+        return true;
+      }
+    }
+
+    async function startBargeInMonitor() {
+      if (!BARGE_IN_ENABLED || bargeInStarting || bargeInTimer || voiceCaptureActive()) return;
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return;
+      if (Date.now() < bargeInSuppressUntil) return;
+      if (!ttsActiveForBargeIn()) return;
+
+      if (!(await hasGrantedMicrophonePermission())) {
+        if (!bargeInUnavailableLogged) {
+          console.log('[BargeIn] microphone permission is not granted yet');
+          bargeInUnavailableLogged = true;
+        }
+        return;
+      }
+
+      bargeInStarting = true;
+      try {
+        bargeInStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: { ideal: true },
+            noiseSuppression: { ideal: true },
+            autoGainControl: { ideal: false },
+            channelCount: { ideal: 1 },
+          }
+        });
+      } catch (e) {
+        if (!bargeInUnavailableLogged) {
+          console.warn('[BargeIn] monitor unavailable:', e);
+          bargeInUnavailableLogged = true;
+        }
+        return;
+      } finally {
+        bargeInStarting = false;
+      }
+
+      if (!ttsActiveForBargeIn()) {
+        stopBargeInMonitor();
+        return;
+      }
+      if (Date.now() < bargeInSuppressUntil) {
+        stopBargeInMonitor();
+        return;
+      }
+
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      if (!AudioContext) {
+        stopBargeInMonitor();
+        return;
+      }
+
+      try {
+        bargeInAudioCtx = new AudioContext();
+        bargeInAnalyser = bargeInAudioCtx.createAnalyser();
+        bargeInAnalyser.fftSize = 1024;
+        bargeInData = new Uint8Array(bargeInAnalyser.fftSize);
+        const src = bargeInAudioCtx.createMediaStreamSource(bargeInStream);
+        src.connect(bargeInAnalyser);
+        bargeInStartedAt = Date.now();
+        bargeInNoiseFloor = 0.012;
+        bargeInCandidateSince = 0;
+        bargeInTimer = setInterval(sampleBargeInMic, 80);
+      } catch (e) {
+        console.warn('[BargeIn] analyser unavailable:', e);
+        stopBargeInMonitor();
+      }
+    }
+
+    function stopBargeInMonitor() {
+      if (bargeInTimer) {
+        clearInterval(bargeInTimer);
+        bargeInTimer = null;
+      }
+      if (bargeInStream) {
+        bargeInStream.getTracks().forEach(t => t.stop());
+        bargeInStream = null;
+      }
+      if (bargeInAudioCtx) {
+        try { bargeInAudioCtx.close(); } catch(e) {}
+      }
+      bargeInAudioCtx = null;
+      bargeInAnalyser = null;
+      bargeInData = null;
+      bargeInCandidateSince = 0;
+      bargeInStarting = false;
+    }
+
+    function sampleBargeInMic() {
+      if (!ttsActiveForBargeIn()) {
+        stopBargeInMonitor();
+        return;
+      }
+      if (!bargeInAnalyser || !bargeInData) return;
+
+      bargeInAnalyser.getByteTimeDomainData(bargeInData);
+      let sum = 0;
+      for (let i = 0; i < bargeInData.length; i++) {
+        const v = (bargeInData[i] - 128) / 128;
+        sum += v * v;
+      }
+
+      const rms = Math.sqrt(sum / bargeInData.length);
+      const now = Date.now();
+      const elapsed = now - bargeInStartedAt;
+
+      // The first slice includes speaker echo; treat it as the local baseline.
+      if (elapsed < 800) {
+        bargeInNoiseFloor = bargeInNoiseFloor * 0.82 + rms * 0.18;
+        return;
+      }
+
+      const threshold = Math.max(0.022, bargeInNoiseFloor * 2.15);
+      if (rms > threshold) {
+        if (!bargeInCandidateSince) bargeInCandidateSince = now;
+        if (now - bargeInCandidateSince > 180) {
+          interruptTtsForUserSpeech(rms, threshold);
+        }
+      } else {
+        bargeInCandidateSince = 0;
+        if (rms < bargeInNoiseFloor * 1.25) {
+          bargeInNoiseFloor = bargeInNoiseFloor * 0.98 + rms * 0.02;
+        }
+      }
+    }
+
+    function interruptTtsForUserSpeech(rms, threshold) {
+      const now = Date.now();
+      if (now - bargeInLastInterruptAt < 1500) return;
+      bargeInLastInterruptAt = now;
+      console.log(`[BargeIn] user speech detected rms=${rms.toFixed(4)} threshold=${threshold.toFixed(4)}`);
+      sendTtsInterrupt('barge_in');
+      setUIState('recording');
+      setTimeout(() => {
+        if (!voiceCaptureActive() && !isStreaming) {
+          startVoiceCapture({ requestCamera: false });
+        }
+      }, 120);
     }
 
     // ---- Desktop browser-mic recorder (Linux port) ----
@@ -5776,11 +5950,8 @@
       unlockTtsAudio();
 
       // TTS 재생 중이면 즉시 중단
-      if (ttsAudioPlaying || ttsAudioQueue.length > 0) {
-        stopTtsPlayback();
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ type: 'tts_interrupt' }));
-        }
+      if (ttsActiveForBargeIn()) {
+        sendTtsInterrupt('manual');
       }
 
       if (browserSpeechAvailable()) {
