@@ -83,11 +83,18 @@ class AssistantSession:
             "message_count": self.message_count,
             "created_at": self.created_at,
             "total_cost_usd": self.total_cost_usd,
+            # Persist the rolling context so Jarvis still remembers the
+            # conversation after a server restart. Images are already
+            # replaced by text markers, so every entry is JSON-safe text.
+            "messages": [
+                m for m in self.messages[-HISTORY_LIMIT:]
+                if isinstance(m.get("content"), str)
+            ],
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "AssistantSession":
-        return cls(
+        session = cls(
             name=data.get("name", "unnamed"),
             cwd=data.get("cwd"),
             model_alias=data.get("model", DEFAULT_MODEL),
@@ -96,6 +103,15 @@ class AssistantSession:
             created_at=data.get("created_at"),
             total_cost_usd=data.get("total_cost_usd", 0.0),
         )
+        saved = data.get("messages")
+        if isinstance(saved, list):
+            session.messages = [
+                m for m in saved
+                if isinstance(m, dict)
+                and m.get("role") in ("user", "assistant")
+                and isinstance(m.get("content"), str)
+            ][-HISTORY_LIMIT:]
+        return session
 
     def change_model(self, model_alias: str) -> str:
         """Switch model → start a fresh conversation."""

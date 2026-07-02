@@ -152,4 +152,4 @@ macOS 원본 모듈(app.py, hotkey_manager, gesture_control, hue_controller 등)
 - [ ] 웨이크워드("자비스") — 브라우저 상시 청취 + 로컬 키워드 감지
 - [ ] TTS 보이스/속도 설정 UI (`OPENAI_TTS_VOICE` 노출)
 - [ ] 얼굴 DB 서버 저장 (현재 localStorage — 기기별 분리됨)
-- [ ] 대화 히스토리 서버 재시작 시 유지 (현재 인메모리)
+- [x] 대화 히스토리 서버 재시작 시 유지 (assistant_sessions.json에 최근 20턴 저장)
